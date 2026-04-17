@@ -1,0 +1,51 @@
+# --- Compiled Object files ---
+*.o
+*.obj
+*.slo
+*.lo
+*.ko
+
+# --- Compiled Dynamic libraries ---
+*.so
+*.dylib
+*.dll
+
+# --- Compiled Static libraries ---
+*.lai
+*.la
+*.a
+*.lib
+
+# --- Executables ---
+*.exe
+*.out
+*.app
+
+# --- CUDA Specific Artifacts ---
+# Source: https://github.com/github/gitignore/blob/main/CUDA.gitignore
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+
+# --- Build Directories ---
+[Bb]uild/
+bin/
+obj/
+
+# --- CMake Generated Files ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+
+# --- IDE & Editor Specific ---
+.vscode/
+.idea/
+*.swp
+*.bak
+*.pfx

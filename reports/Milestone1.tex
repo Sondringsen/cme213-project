@@ -1,0 +1,80 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{titlesec}
+
+\setlist{itemsep=1pt, topsep=1pt, parsep=0pt}
+\titlespacing*{\section}{0pt}{6pt}{2pt}
+
+\title{\vspace{-3em}CME 213 Final Project - Milestone 1: Proposal\\
+\large Building and Optimizing a Small LLM from Scratch}
+\author{Nils Astrup Toft \quad and \quad Sondre Rogde}
+\date{April 13, 2026}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\section*{1. Project Focus}
+
+We will build and optimize a small GPT-2-style transformer language model from scratch in C++/CUDA, distributed across multiple GPUs using MPI. The application domain is deep learning. Our goal is not state-of-the-art language modeling, but a thorough understanding of the parallel primitives that make modern LLM training possible.
+
+Parallelism is essential: even a small transformer is dominated by dense matrix multiplications and attention operations that demand GPUs, and training throughput scales with multiple GPUs only if gradient synchronization is implemented carefully. Indeed from lecture 3 we saw that training GPT-3 would take 355 years on a single GPU, while only 34 days on a sufficiently large GPU cluster. 
+
+As a final demonstration of the system, we will run two model variants in parallel: a baseline word-level model and a variant augmented with part-of-speech (POS) embeddings concatenated to the word embeddings. This is a lightweight extension with no new kernels, just a small change to the input embedding stage, and gives a natural setting to discuss task-level parallelism on top of the data-parallel inner loop. The POS extension is motivated by ongoing research with Prof.\ Gunnar Carlsson on feature engineering for language models; the linguistic question lives in that research project, while here it serves as a clean test of the infrastructure's modularity.
+
+\section*{2. Core Algorithms}
+
+\begin{itemize}
+    \item \textbf{Tiled GEMM} for the linear layers, using shared-memory blocking and register tiling.
+    \item \textbf{Flash Attention} (forward and backward) with online softmax and SRAM tiling, to keep attention memory-efficient as sequence length grows.
+    \item \textbf{Fused auxiliary kernels} for LayerNorm, GELU, residual additions, softmax, and cross-entropy loss, to minimize global memory round-trips.
+    \item \textbf{Mixed precision (BF16)} for the forward and backward passes, with FP32 master weights for stability.
+    \item \textbf{Ring All-Reduce} for gradient synchronization across GPUs.
+    \item \textbf{Adam optimizer} for the parameter update step.
+\end{itemize}
+
+\section*{3. Parallel Computing Approach}
+
+\textbf{CUDA (intra-GPU).} The transformer forward and backward passes will be expressed as a sequence of custom CUDA kernels, with GEMM and Flash Attention as the main work and pointwise operations fused to avoid redundant memory traffic. We will use shared memory as a software-managed cache and apply standard techniques (coalesced access, avoiding bank conflicts, double buffering) to push each kernel close to the compute or bandwidth roof.
+
+\textbf{MPI (inter-GPU).} We will use data parallelism: each rank holds a full model copy and processes a different mini-batch shard. Gradients are synchronized via Ring All-Reduce using CUDA-aware MPI for direct GPU-to-GPU transfers, with the All-Reduce of layer $\ell$'s gradients overlapped with the backward computation of earlier layers.
+
+\textbf{Two-level parallelism (final phase).} For the POS comparison we will benchmark running both variants concurrently on disjoint GPU groups versus sequentially with full data-parallel scaling, giving a concrete Amdahl-style analysis of when task parallelism beats data parallelism.
+
+\section*{4. Planned Deliverables}
+
+\begin{itemize}
+    \item A working C++/CUDA training pipeline for a small transformer ($\sim$10--30M parameters, 3--6 layers, hidden dimension 256--512), trained on WikiText-2 or a similar small corpus.
+    \item Custom CUDA kernels for GEMM, Flash Attention, and fused normalization/activation operations.
+    \item MPI-based data-parallel training with overlapped Ring All-Reduce.
+    \item A performance study including: Roofline plots for the main kernels, strong and weak scaling curves, an isoefficiency analysis for the data-parallel scheme, and an $\alpha + \beta n$ communication cost breakdown.
+    \item A comparison of the baseline and POS-augmented configurations, both in terms of training throughput and final perplexity.
+    \item A 6-page final report presenting the design, implementation, and performance analysis.
+\end{itemize}
+
+\section*{5. Timeline and Risks}
+
+\begin{center}
+\begin{tabular}{@{}llp{9.5cm}@{}}
+\toprule
+\textbf{Milestone} & \textbf{Due} & \textbf{Plan} \\
+\midrule
+MS 2: Design        & Apr 27 & Detailed software design, related work, kernel and MPI plans, profiling plan. Skeleton training loop running end-to-end with reference (e.g.\ cuBLAS) kernels for correctness. \\
+MS 3: GPU Kernels   & May 11 & Custom CUDA kernels (GEMM, Flash Attention fwd/bwd, fused ops) integrated into the single-GPU training loop; initial Roofline analysis. \\
+MS 4: Distributed   & May 27 & MPI data-parallel training with overlapped Ring All-Reduce; preliminary scaling benchmarks; baseline vs POS comparison underway. \\
+Final Report        & Jun 8  & Code, full performance study, parallel POS-sweep results, 6-page report. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Risks we foresee.}
+\begin{itemize}
+    \item \emph{Scope creep on model size.} We will keep the model small enough that a training run takes minutes, not hours, to allow rapid iteration.
+    \item \emph{Numerical correctness of custom kernels.} BF16 mixed precision and Flash Attention's recomputed backward are easy to get subtly wrong; we will validate each kernel against a reference (PyTorch or cuBLAS) before integration.
+    \item \emph{Communication--computation overlap.} Genuine overlap requires careful stream management; if it proves too difficult we will fall back to a non-overlapped Ring All-Reduce and analyze the resulting overhead.
+\end{itemize}
+
+\end{document}
