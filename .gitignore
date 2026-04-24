@@ -49,3 +49,5 @@ compile_commands.json
 *.swp
 *.bak
 *.pfx
+
+.DS_Store
