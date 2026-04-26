@@ -20,79 +20,100 @@
 
 \section*{1. Project Scope and Problem Definition}
 
-We are building an end-to-end training pipeline for a small GPT-2-style transformer in C++/CUDA, distributed across multiple GPUs via MPI. The model is a decoder-only transformer with 6 layers, hidden dimension 512, 8 attention heads, and a context length of 256 tokens, giving roughly 30M parameters. The dataset is WikiText-2 ($\sim$2M tokens, vocabulary of 20{,}000). Training uses BF16 mixed precision with FP32 master weights and the Adam optimizer.
-
-\textbf{Inputs:} a preprocessed corpus of token IDs (prepared once in Python). \textbf{Outputs:} trained model weights and a log of per-epoch training loss and validation perplexity. \textbf{Simplifications:} we use a fixed-length context (no variable-length batching), a simple tokenizer (word-level, matching WikiText-2 convention), and data parallelism only (no tensor or pipeline parallelism).
-
-A successful project means: (i) validation perplexity decreases over training, confirming numerical correctness; (ii) custom CUDA kernels achieve a measurable fraction of peak hardware performance; (iii) multi-GPU training scales with quantifiable efficiency; and (iv) the POS-augmented variant can be trained in parallel with the baseline as a demonstration of task-level parallelism.
+We are building an end-to-end C++/CUDA training pipeline for a decoder-only GPT-2-style transformer~\cite{radford2019}: 6 layers, hidden dimension 512, 8 attention heads, context 256 tokens ($\sim$30M parameters), trained on WikiText-2 ($\sim$2M tokens, vocabulary 20{,}000) with BF16 mixed precision, FP32 master weights, and the Adam optimizer, distributed across multiple GPUs via MPI. Inputs are preprocessed token IDs; outputs are trained weights and a per-epoch training loss and validation perplexity log. We use a fixed-length context, word-level tokenization, and data parallelism only. A successful outcome means validation perplexity decreases over training, custom CUDA kernels achieve measurable hardware utilization, multi-GPU training scales efficiently, and a POS-augmented variant demonstrates task-level parallelism.
 
 \section*{2. Survey of Related Work}
 
-The GPT-2 architecture (Radford et al., 2019) defines our model structure: a pre-norm decoder-only transformer with GELU activations, implemented at smaller scale. For GEMM optimization we build on the tiling strategy from lectures 7--8, extended to \textbf{BF16 mixed precision with batched execution} (distinct from the FP32 single-matrix GEMM in HW4); key references are Huang et al.\ (2024) and the CUTLASS documentation on register tiling and Tensor Core usage. For attention, we implement the full \textbf{forward and backward} Flash Attention (Dao et al., 2022; Dao, 2023), extending beyond the standalone forward kernel in HW6 by integrating recomputation-based gradients into the training loop. Our MPI strategy is data-parallel gradient All-Reduce (Li et al., 2020; Sergeev \& Del Balso, 2018), which is a different communication pattern from the sequence-distributed attention in HW7. The closest existing project is Karpathy's \texttt{llm.c} (2024); we differ by writing all kernels from scratch (rather than cuBLAS/cuDNN), implementing our own Ring All-Reduce (rather than NCCL), and adding the POS comparison.
+The GPT-2 architecture~\cite{radford2019} defines our model structure. For GEMM, we follow the shared-memory tiling and register-file strategy of~\cite{boehm2022}. Our custom BF16 batched GEMM \emph{extends} HW4 (FP32, single matrix) by operating in mixed precision with FP32 accumulation and handling the strided batched layout required for multi-head projections. For attention, we implement the full Flash Attention forward and backward~\cite{dao2022,dao2023}. This \emph{extends} HW6 (a forward-only standalone kernel) by integrating recomputation-based gradients into the training loop. Our MPI strategy is data-parallel gradient All-Reduce~\cite{li2020,sergeev2018}, a different pattern from the sequence-distributed attention in HW7. Compared with \texttt{llm.c}~\cite{karpathy2024}, we write all kernels from scratch and implement our own Ring All-Reduce rather than using cuBLAS/NCCL.
 
 \section*{3. Computational Challenges}
 
-\textbf{Numerical correctness at BF16.} The reduced mantissa (8 bits vs.\ 24 for FP32) makes accumulation errors in GEMM and softmax significant. We will accumulate in FP32 within each kernel and validate against PyTorch, accepting relative error below $10^{-2}$.
+\textbf{Numerical correctness at BF16.} The reduced mantissa (8 bits vs.\ 24 for FP32) makes accumulation errors in GEMM and softmax significant. We accumulate in FP32 within each kernel and validate against PyTorch, accepting relative error below $10^{-2}$.
 
-\textbf{Backward pass complexity.} A full transformer backward involves six distinct GEMMs per layer plus the Flash Attention backward with recomputation. Correct gradient flow requires careful management of transposed weights and residual connections. We will validate layer-by-layer against PyTorch autograd.
-
-\textbf{Communication--computation overlap.} Overlapping All-Reduce with the backward pass requires launching reductions on a separate CUDA stream and synchronizing only when the optimizer needs the averaged gradient. Getting stream dependencies right without accidentally serializing is the main MPI challenge.
+\textbf{Backward pass and communication overlap.} A full transformer backward involves six GEMMs per layer plus the Flash Attention backward with recomputation, requiring careful management of transposed weights and residual connections. Overlapping the All-Reduce with the backward pass adds further complexity: reductions must run on a separate CUDA stream and synchronize only when the optimizer needs the averaged gradient. We validate gradients layer-by-layer against PyTorch autograd.
 
 \section*{4. CUDA Implementation Plan}
 
-\textbf{BF16 batched GEMM.} All linear layers (Q/K/V projections, output projection, FFN) are batched matrix multiplications. We tile into shared memory, accumulate in FP32 registers, and write BF16 outputs. This extends HW4 by operating in mixed precision and handling the strided batched layout for multi-head attention.
+\textbf{BF16 batched GEMM.} All linear layers (Q/K/V projections, output projection, FFN) are tiled into shared memory, accumulated in FP32 registers, and written as BF16 outputs.
 
-\textbf{Flash Attention forward and backward.} The forward kernel tiles over sequence length with online softmax in SRAM. The backward kernel recomputes attention weights from saved statistics and produces gradients for Q, K, V. This extends HW6 by adding the full backward pass and integrating it into the training loop.
+\textbf{Flash Attention forward and backward.} The forward kernel tiles over sequence length with online softmax in SRAM; the backward recomputes attention weights from saved statistics and produces gradients for Q, K, V.
 
-\textbf{Fused LayerNorm / GELU / residual.} These individually memory-bound pointwise operations are fused into single kernels. Entirely project-specific (not covered in any homework).
+\textbf{Fused LayerNorm / GELU / residual.} These individually memory-bound operations are fused into single kernels to eliminate redundant global memory traffic.
 
-\textbf{Fused cross-entropy loss + Adam optimizer.} The loss and softmax gradient are fused to avoid materializing probabilities. The Adam kernel updates FP32 master weights from BF16 gradients and moment buffers in a single pass.
+\textbf{Fused cross-entropy + Adam.} The loss and softmax gradient are fused to avoid materializing probabilities; the Adam kernel updates FP32 master weights from BF16 gradients and moment buffers in one pass.
+
+All kernels are validated against PyTorch before optimization.
 
 \section*{5. MPI Implementation Plan}
 
-Each MPI rank owns a full model copy and a disjoint data shard. Per training step: (i) each rank runs forward/backward on its local mini-batch; (ii) gradients are averaged via Ring All-Reduce; (iii) each rank applies the optimizer. Since all ranks start from identical weights and apply the same averaged gradients, replicas stay synchronized.
+Each MPI rank owns a full model copy and a disjoint data shard. Per step: (i) each rank runs forward/backward on its mini-batch; (ii) gradients are averaged via Ring All-Reduce; (iii) each rank applies the optimizer. The Ring All-Reduce uses \texttt{MPI\_Isend}/\texttt{MPI\_Irecv} with CUDA-aware MPI for direct GPU-to-GPU transfers; small tensors are bucketed to amortize startup latency. The All-Reduce of layer $\ell$'s gradients is overlapped with the backward pass of earlier layers on a separate CUDA stream.
 
-The Ring All-Reduce is implemented manually using \texttt{MPI\_Isend}/\texttt{MPI\_Irecv} with CUDA-aware MPI for direct GPU-to-GPU transfers. We bucket small gradient tensors to amortize startup latency ($\alpha$). For the POS comparison, we split the world communicator via \texttt{MPI\_Comm\_split} into two independent sub-groups running data-parallel training with no cross-group communication.
+For the POS comparison, \texttt{MPI\_Comm\_split} partitions the communicator into two independent sub-groups running separate data-parallel training runs with no cross-group communication.
 
 \section*{6. Profiling and Performance Analysis Plan}
 
-\textbf{Kernel-level Roofline.} For each major kernel (batched GEMM, Flash Attention fwd/bwd, fused LayerNorm), measure achieved FLOPS and memory bandwidth via CUDA events and \texttt{ncu} profiling. Plot on a Roofline diagram to classify each kernel as compute- or memory-bound and quantify headroom.
+\textbf{Kernel Roofline.} Measure achieved FLOPS and memory bandwidth for each major kernel (batched GEMM, Flash Attention fwd/bwd, fused LayerNorm) via CUDA events and \texttt{ncu}; plot on a Roofline diagram to classify compute- vs.\ memory-bound behavior.
 
-\textbf{Training throughput.} Measure tokens/second on a single GPU and compare against a PyTorch reference to quantify the gap.
+\textbf{Scaling.} Strong scaling: fix total batch size, vary GPU count, measure efficiency $E = S(P)/P$. Weak scaling: scale per-GPU batch proportionally and check for constant step time.
 
-\textbf{Scaling.} Strong scaling: fix total batch size, increase GPU count, measure efficiency $E = S(P)/P$ and compare to Amdahl's law. Weak scaling: scale per-GPU batch proportionally and check for constant step time.
+\textbf{Communication cost.} Time Ring All-Reduce for varying message sizes; fit $\alpha + \beta n$; compare against theoretical Ring and Tree lower bounds.
 
-\textbf{Communication cost.} Time Ring All-Reduce for varying message sizes, fit $\alpha + \beta n$, compare against theoretical lower bounds for Ring and Tree topologies.
-
-\textbf{Task vs.\ data parallelism.} With 4 GPUs: (a) both POS configs on 2 GPUs each simultaneously vs.\ (b) each config on 4 GPUs sequentially. Measure total wall-clock time.
+\textbf{Task vs.\ data parallelism.} With 4 GPUs: both POS configs simultaneously on 2 GPUs each vs.\ each config sequentially on 4 GPUs; compare total wall-clock time.
 
 \section*{7. Timeline}
 
 \begin{center}
-\begin{tabular}{@{}lp{11cm}@{}}
+\begin{tabular}{@{}lp{10.5cm}@{}}
 \toprule
-\textbf{Week (date)} & \textbf{Tasks} \\
+\textbf{Week} & \textbf{Tasks} \\
 \midrule
-Wk 5 (Apr 28--May 2) & Skeleton training loop with cuBLAS reference kernels; validate forward pass against PyTorch; data loading pipeline for WikiText-2. \\
-Wk 6 (May 5--9) & Implement custom batched BF16 GEMM kernel; swap into training loop; validate numerical correctness; begin fused LayerNorm/GELU kernel. \\
-Wk 7 (May 12--16) & Flash Attention forward + backward kernels; integrate into training loop; validate full backward pass gradients against PyTorch. \\
-Wk 8 (May 19--23) & Fuse remaining kernels (cross-entropy, Adam); single-GPU training confirmed working; begin Roofline profiling of each kernel. \\
-Wk 9 (May 24--28) & MPI Ring All-Reduce implementation; multi-GPU training; scaling benchmarks; POS-augmented variant; begin report writing. \\
-Wk 10 (Jun 1--8) & Complete scaling and communication experiments; task-vs-data parallelism comparison; finish 6-page report. \\
+Wk 5 (Apr 28--May 2) & Skeleton training loop with cuBLAS reference; forward pass validated against PyTorch; WikiText-2 data pipeline. \\
+Wk 6 (May 5--9)      & Custom BF16 batched GEMM integrated and validated; fused LayerNorm/GELU kernel. \\
+Wk 7 (May 12--16)    & Flash Attention forward + backward; full backward pass validated against PyTorch autograd. \\
+Wk 8 (May 19--23)    & Fused cross-entropy and Adam; end-to-end single-GPU training confirmed; Roofline profiling. \\
+Wk 9 (May 26--30)    & MPI Ring All-Reduce; multi-GPU training; scaling benchmarks; POS variant. \\
+Wk 10 (Jun 1--8)     & Communication experiments; task-vs-data comparison; 6-page final report. \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Buffer time is built into weeks 9--10. If kernel optimization runs long, we fall back to cuBLAS for one kernel (e.g.\ the FFN GEMM) and focus custom work on the attention and fused kernels, which are more interesting from a performance analysis perspective.
+\begin{thebibliography}{9}
 
-\medskip
-\noindent\textbf{References.}
-Dao (2023). FlashAttention-2. \textit{arXiv:2307.08691}.
-Dao et al.\ (2022). FlashAttention. \textit{NeurIPS}.
-Huang et al.\ (2024). How to Optimize a CUDA Matmul Kernel. \textit{siboehm.com}.
-Karpathy (2024). llm.c. \textit{github.com/karpathy/llm.c}.
-Li et al.\ (2020). PyTorch Distributed. \textit{VLDB}.
-Radford et al.\ (2019). Language Models are Unsupervised Multitask Learners. \textit{OpenAI}.
-Sergeev \& Del Balso (2018). Horovod. \textit{arXiv:1802.05799}.
+\bibitem{boehm2022}
+S.\ Boehm.
+How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog.
+\textit{siboehm.com}, 2022.
+
+\bibitem{dao2022}
+T.\ Dao, D.\ Fu, S.\ Ermon, A.\ Rudra, and C.\ R\'{e}.
+FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+In \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+
+\bibitem{dao2023}
+T.\ Dao.
+FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
+\textit{arXiv:2307.08691}, 2023.
+
+\bibitem{karpathy2024}
+A.\ Karpathy.
+\texttt{llm.c}.
+\url{https://github.com/karpathy/llm.c}, 2024.
+
+\bibitem{li2020}
+S.\ Li et al.
+PyTorch Distributed: Experiences on Accelerating Data Parallel Training.
+\textit{Proceedings of the VLDB Endowment}, 2020.
+
+\bibitem{radford2019}
+A.\ Radford et al.
+Language Models are Unsupervised Multitask Learners.
+OpenAI Technical Report, 2019.
+
+\bibitem{sergeev2018}
+A.\ Sergeev and M.\ Del Balso.
+Horovod: Fast and Easy Distributed Deep Learning in TensorFlow.
+\textit{arXiv:1802.05799}, 2018.
+
+\end{thebibliography}
 
 \end{document}
