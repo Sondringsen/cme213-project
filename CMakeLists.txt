@@ -1,0 +1,77 @@
+cmake_minimum_required(VERSION 3.18)
+project(cme213_llm LANGUAGES CXX CUDA)
+
+# ---------------------------------------------------------------------------
+# Build configuration
+# ---------------------------------------------------------------------------
+# C++17 on host and device. CUDA toolkit >= 11 is required for CUDA C++17.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# By default compile for a fan of common NVIDIA architectures. Override from
+# the command line with -DCMAKE_CUDA_ARCHITECTURES=80 when you know the target
+# GPU (e.g. 70=V100, 75=T4, 80=A100, 86=RTX 30xx, 89=RTX 40xx, 90=H100).
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 70 80 86 90)
+endif()
+
+# Default to Release. Debug builds add `-G` for device code, which kills
+# performance; we want Release unless explicitly debugging.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS}  -Wall -Wextra")
+# --expt-relaxed-constexpr: lets us use constexpr in some __device__ contexts
+# --expt-extended-lambda  : lets us pass __device__ lambdas into templates
+# -lineinfo               : line info for Nsight Compute, no perf cost
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --expt-extended-lambda -lineinfo")
+
+# ---------------------------------------------------------------------------
+# Core library: every kernel + every CPU oracle. Tests link against this.
+# ---------------------------------------------------------------------------
+add_library(llm STATIC
+    # GEMM
+    src/kernels/gemm.cu
+    src/kernels/gemm_cpu.cpp
+    # LayerNorm
+    src/kernels/layernorm.cu
+    src/kernels/layernorm_cpu.cpp
+    # Softmax
+    src/kernels/softmax.cu
+    src/kernels/softmax_cpu.cpp
+    # Cross-entropy
+    src/kernels/cross_entropy.cu
+    src/kernels/cross_entropy_cpu.cpp
+    # Flash Attention
+    src/kernels/attention.cu
+    src/kernels/attention_cpu.cpp
+)
+
+# Project-wide include root. Lets every source say
+#     #include "kernels/<x>.cuh" / #include "utils/<y>.hpp"
+target_include_directories(llm PUBLIC ${CMAKE_SOURCE_DIR}/src)
+set_target_properties(llm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+enable_testing()
+
+# All test executables look the same: build one .cu, link llm, register
+# with CTest. The tests/ dir is added to the include path so each can do
+#   #include "test_utils.hpp"
+function(add_kernel_test name)
+    add_executable(${name} tests/${name}.cu)
+    target_link_libraries(${name} PRIVATE llm)
+    target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_kernel_test(test_gemm)
+add_kernel_test(test_layernorm)
+add_kernel_test(test_softmax)
+add_kernel_test(test_cross_entropy)
+add_kernel_test(test_attention)
