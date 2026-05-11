@@ -9,7 +9,7 @@
 \setlist{itemsep=1pt, topsep=1pt, parsep=0pt}
 \titlespacing*{\section}{0pt}{6pt}{2pt}
 
-\title{\vspace{-3em}CME 213 Final Project --- Milestone 2: Design\\
+\title{\vspace{-3em}CME 213 Final Project - Milestone 2: Design\\
 \large Building and Optimizing a Small LLM from Scratch}
 \author{Nils Astrup Toft \quad and \quad Sondre Rogde}
 \date{April 27, 2026}
@@ -20,11 +20,11 @@
 
 \section*{1. Project Scope and Problem Definition}
 
-We are building an end-to-end C++/CUDA training pipeline for a decoder-only GPT-2-style transformer~\cite{radford2019}: 6 layers, hidden dimension 512, 8 attention heads, context 256 tokens ($\sim$30M parameters), trained on WikiText-2 ($\sim$2M tokens, vocabulary 20{,}000) with BF16 mixed precision, FP32 master weights, and the Adam optimizer, distributed across multiple GPUs via MPI. Inputs are preprocessed token IDs; outputs are trained weights and a per-epoch training loss and validation perplexity log. We use a fixed-length context, word-level tokenization, and data parallelism only. A successful outcome means validation perplexity decreases over training, custom CUDA kernels achieve measurable hardware utilization, multi-GPU training scales efficiently, and a POS-augmented variant demonstrates task-level parallelism.
+We are building an end-to-end C++/CUDA training pipeline for a decoder-only GPT-2-style transformer~\cite{radford2019}: 12 layers, hidden dimension 768, 8 attention heads, context 512 tokens ($\sim$120M parameters), trained on WikiText-2 ($\sim$2M tokens, vocabulary 30{,}000) with BF16 mixed precision, FP32 master weights, and the Adam optimizer, distributed across multiple GPUs via MPI. Inputs are preprocessed token IDs; outputs are trained weights and a per-epoch training loss and validation perplexity log. We use a fixed-length context, word-level tokenization, and data parallelism only. A successful outcome means validation perplexity decreases over training, custom CUDA kernels achieve measurable hardware utilization, multi-GPU training scales efficiently, and a POS-augmented variant demonstrates task-level parallelism.
 
 \section*{2. Survey of Related Work}
 
-The GPT-2 architecture~\cite{radford2019} defines our model structure. For GEMM, we follow the shared-memory tiling and register-file strategy of~\cite{boehm2022}. Our custom BF16 batched GEMM \emph{extends} HW4 (FP32, single matrix) by operating in mixed precision with FP32 accumulation and handling the strided batched layout required for multi-head projections. For attention, we implement the full Flash Attention forward and backward~\cite{dao2022,dao2023}. This \emph{extends} HW6 (a forward-only standalone kernel) by integrating recomputation-based gradients into the training loop. Our MPI strategy is data-parallel gradient All-Reduce~\cite{li2020,sergeev2018}, a different pattern from the sequence-distributed attention in HW7. Compared with \texttt{llm.c}~\cite{karpathy2024}, we write all kernels from scratch and implement our own Ring All-Reduce rather than using cuBLAS/NCCL.
+The GPT-2 architecture~\cite{radford2019} defines our model structure. For GEMM, we follow the shared-memory tiling and register-file strategy of~\cite{boehm2022}; while HW4 covers tiled GEMM, our implementation goes further with \emph{batched BF16 mixed precision}, FP32 accumulation within tiles, and the strided batched layout required for multi-head projections. For attention, while HW6 covers Flash Attention, we extend to a \emph{full forward/backward pass} with recomputation-based gradients~\cite{dao2022,dao2023} integrated into the training loop. Our MPI strategy is data-parallel gradient All-Reduce~\cite{li2020,sergeev2018}. Compared with \texttt{llm.c}~\cite{karpathy2024}, we write all kernels from scratch and implement our own Ring All-Reduce.
 
 \section*{3. Computational Challenges}
 
