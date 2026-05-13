@@ -39,9 +39,14 @@ obj/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-Makefile
+[Bb]uild/Makefile
 install_manifest.txt
 compile_commands.json
+
+# --- Generated test reference data (run scripts/generate_ref_data.py) ---
+tests/ref_data/*.bin
+.venv/
+*.DS_Store
 
 # --- IDE & Editor Specific ---
 .vscode/
