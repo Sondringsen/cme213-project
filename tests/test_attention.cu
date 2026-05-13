@@ -56,6 +56,8 @@ static int run_case(int B, int H, int S, int D, bool causal,
     double gflops = flops / (ms * 1e-3) / 1e9;
     std::printf("  GPU: %7.3f ms/iter, %7.1f GFLOPS (avg of %d)\n",
                 ms, gflops, N_ITER);
+    std::printf("PERF: kernel=attention B=%d H=%d S=%d D=%d causal=%d ms=%.4f gflops=%.1f\n",
+                B, H, S, D, (int)causal, ms, gflops);
 
     if (check_correctness) {
         dO.copy_to_host(hO_gpu.data());

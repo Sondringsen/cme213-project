@@ -42,6 +42,8 @@ static int run_case(int N, int V, bool check_correctness) {
     double gbps  = bytes / (ms * 1e-3) / 1e9;
     std::printf("  GPU: %7.3f ms/iter, %7.1f GB/s (avg of %d)\n",
                 ms, gbps, N_ITER);
+    std::printf("PERF: kernel=softmax N=%d V=%d ms=%.4f bandwidth_gbs=%.1f\n",
+                N, V, ms, gbps);
 
     if (check_correctness) {
         dy.copy_to_host(hy_gpu.data());

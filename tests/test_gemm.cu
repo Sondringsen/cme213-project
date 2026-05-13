@@ -53,6 +53,8 @@ static int run_case(int M, int N, int K, bool check_correctness) {
     double gflops = (2.0 * M * N * K) / (ms * 1e-3) / 1e9;
     std::printf("  GPU: %7.3f ms/iter, %7.1f GFLOPS (avg of %d)\n",
                 ms, gflops, N_ITER);
+    std::printf("PERF: kernel=gemm M=%d N=%d K=%d ms=%.4f gflops=%.1f\n",
+                M, N, K, ms, gflops);
 
     if (check_correctness) {
         dC.copy_to_host(hC_gpu.data());

@@ -49,10 +49,9 @@ constexpr int LN_BLOCK = 256;
  *       __syncthreads()
  * This runs in log2(BLOCK) = 8 steps.
  *
- * Numerical note: we compute var = E[x^2] - (E[x])^2. This is fine in FP32
- * for the layer sizes we care about (H up to a few thousand), but it can
- * lose precision badly in BF16. When we switch to BF16 we should swap to
- * Welford's online variance for that reason.
+ * Numerical note: we compute var = E[(x - mean)^2] in a stable two-sub-pass
+ * approach (pass 2a), avoiding the catastrophic cancellation that would arise
+ * from the algebraically equivalent but unstable formula E[x^2] - E[x]^2.
  */
 __global__ void layernorm_forward_kernel(const float* __restrict__ x,
                                          const float* __restrict__ gamma,
@@ -67,42 +66,46 @@ __global__ void layernorm_forward_kernel(const float* __restrict__ x,
 
     int tid = threadIdx.x;
 
-    // ---- Pass 1: per-thread partial sum and sum-of-squares ----
-    float sum    = 0.0f;
-    float sum_sq = 0.0f;
+    // ---- Pass 1: per-thread partial sum ----
+    float sum = 0.0f;
     for (int i = tid; i < H; i += LN_BLOCK) {
-        float v = row_x[i];
-        sum    += v;
-        sum_sq += v * v;
+        sum += row_x[i];
     }
 
-    // ---- Block-level reduction in shared memory ----
-    // Two parallel reductions (sum and sum-of-squares). We share a single
-    // 2*LN_BLOCK array rather than declaring two separate ones for clarity
-    // of memory layout.
+    // ---- Pass 1 block reduction: compute mean ----
+    // A single shared array is sufficient; we reuse it for variance below.
     __shared__ float s_sum[LN_BLOCK];
-    __shared__ float s_sq[LN_BLOCK];
     s_sum[tid] = sum;
-    s_sq[tid]  = sum_sq;
     __syncthreads();
 
-    // Tree reduction: in each step, the lower half of active threads pulls
-    // in a value from the upper half. After log2(LN_BLOCK) steps, s_sum[0]
-    // holds the total sum, s_sq[0] the total sum-of-squares.
+    // Tree reduction: after log2(LN_BLOCK) steps s_sum[0] holds the total sum.
     #pragma unroll
     for (int s = LN_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid] += s_sum[tid + s];
-            s_sq[tid]  += s_sq[tid + s];
-        }
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
         __syncthreads();
     }
-
-    // Every thread now reads the reduced values (broadcast from shared mem).
     float mean = s_sum[0] / H;
-    float var  = s_sq[0]  / H - mean * mean;
+
+    // ---- Pass 2a: compute variance stably as E[(x - mean)^2] ----
+    // The alternative formula var = E[x^2] - E[x]^2 is mathematically
+    // equivalent but numerically unstable: it subtracts two large, nearly
+    // equal numbers (catastrophic cancellation). Computing the deviation
+    // directly avoids that precision loss entirely.
+    float var_sum = 0.0f;
+    for (int i = tid; i < H; i += LN_BLOCK) {
+        float d = row_x[i] - mean;
+        var_sum += d * d;
+    }
+    s_sum[tid] = var_sum;   // reuse shared array — previous reduction is done
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = LN_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        __syncthreads();
+    }
     // rsqrtf is a hardware intrinsic; faster than 1.0f / sqrtf().
-    float rstd = rsqrtf(var + eps);
+    float rstd = rsqrtf(s_sum[0] / H + eps);
 
     // ---- Pass 2: write normalized + affine output ----
     // Same strided pattern, same coalescing. gamma and beta are reused

@@ -37,6 +37,8 @@ static int run_case(int N, bool check_correctness) {
     double gb_s = (2.0 * N * sizeof(float)) / (ms * 1e-3) / 1e9;
     std::printf("  GPU: %7.3f ms/iter, %6.1f GB/s (avg of %d)\n",
                 ms, gb_s, N_ITER);
+    std::printf("PERF: kernel=gelu N=%d ms=%.4f bandwidth_gbs=%.1f\n",
+                N, ms, gb_s);
 
     if (check_correctness) {
         dy.copy_to_host(hy_gpu.data());

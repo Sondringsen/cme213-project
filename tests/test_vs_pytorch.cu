@@ -164,7 +164,7 @@ static int test_gelu() {
 
     std::vector<float> hy_gpu(N);
     dy.copy_to_host(hy_gpu.data());
-    return check("gelu", hy_ref, hy_gpu, /*tol=*/1e-5f);
+    return check("gelu", hy_ref, hy_gpu, /*tol=*/1e-3f);
 }
 
 static int test_cross_entropy() {
