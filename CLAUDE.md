@@ -8,6 +8,28 @@ We are building a small GPT-2-style transformer language model from scratch in C
 
 ---
 
+## Compute Cluster
+
+**GPU nodes (`gpu-turing` SLURM partition):**
+- 5 nodes, each with **4 × Quadro RTX 6000** (24 GB GDDR6, Turing sm_75)
+- Per-GPU specs: **16.31 TFLOPS FP32**, **672 GB/s** DRAM bandwidth, 4608 CUDA cores
+- System memory: 128 GB per node
+- CPU: AMD EPYC 7262, 8 cores / 16 threads
+- SLURM resource: `--partition=gpu-turing --gres=gpu:1` (up to 4 GPUs per node)
+- Build flag: `make CUDA_ARCH=75` (sm_75 = Turing)
+
+**Compute nodes (CPU-only):**
+- ~24 nodes, dual Intel, 32 GB RAM, exclusive use (shared with 3 other classes)
+- Not suitable for GPU work; use only for data prep / scripting
+
+**Unknown / to confirm when needed:**
+- CUDA toolkit version on the cluster
+- MPI implementation and whether CUDA-aware MPI is enabled (needed for Phase 5 Ring All-Reduce)
+- Whether the 4 GPUs per node are connected via NVLink or PCIe only (affects multi-GPU bandwidth in Phase 5)
+- Python / PyTorch module availability for `generate_ref_data.py`
+
+---
+
 ## Coding Guidelines
 
 - **Always explain the code.** We are both new to C++ and CUDA. When writing or modifying code, include clear inline comments explaining what each block does and *why*. Do not assume familiarity with CUDA concepts like warps, shared memory, or memory coalescing — explain these where they appear.

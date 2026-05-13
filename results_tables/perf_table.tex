@@ -1,0 +1,18 @@
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{lllrrrr}
+    \toprule
+    \textbf{Kernel} & \textbf{Problem size} & \textbf{Time (ms)} & \textbf{Achieved} & \textbf{AI (F/B)} & \textbf{\% of ceil.} & \textbf{Bound} \\
+    \midrule
+  \texttt{GEMM (tiled)} & $M=N=K=1024$ & 0.923 & 2326.2 GFLOPS & 170.7 & 14.3\% & Compute \\
+  \texttt{Flash Attention} & $B=1,S=2048,D=96$ & 6.059 & 2126.7 GFLOPS & 512.0 & 13.0\% & Compute \\
+  \texttt{LayerNorm} & $N=8192,\ H=768$ & 0.115 & 438.1 GB/s & 0.5 & 65.2\% & Memory \\
+  \texttt{Softmax} & $N=4096,\ V=30000$ & 4.597 & 427.7 GB/s & 0.2 & 63.6\% & Memory \\
+  \texttt{GELU} & $N=4,194,304$ & 0.071 & 469.2 GB/s & 0.8 & 69.8\% & Memory \\
+  \texttt{Cross-Entropy} & $N=128,\ V=30000$ & 0.065 & 474.9 GB/s & 0.4 & 70.7\% & Memory \\
+    \bottomrule
+  \end{tabular}
+  \caption{Best achieved performance per kernel on the Quadro RTX 6000 (Turing sm\_75, FP32 peak 16.3\,TFLOPS, DRAM 672\,GB/s). \emph{AI} = arithmetic intensity (FLOP/byte). \emph{\% of ceil.} = achieved / roofline ceiling for that kernel's AI.}
+  \label{tab:m3_perf}
+\end{table}
