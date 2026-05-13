@@ -5,387 +5,119 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{hyperref}
-\usepackage{listings}
 \usepackage{xcolor}
 \usepackage{caption}
-\usepackage{subcaption}
 \usepackage{microtype}
 \usepackage{parskip}
 
-% Figures are in plots/, tables in results_tables/.
-% Upload those folders to Overleaf alongside this .tex file.
 \graphicspath{{plots/}}
-
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
 
-\lstset{
-  basicstyle=\ttfamily\small,
-  keywordstyle=\color{blue},
-  commentstyle=\color{gray},
-  breaklines=true,
-  frame=single,
-  language=C++
-}
-\title{\vspace{-3em}CME 213 Final Project - Milestone 3: GPU Kernels\\
-\large Building and Optimizing a Small LLM from Scratch}
-\author{Nils Astrup Toft \quad and \quad Sondre Rogde}
+\title{\vspace{-2em}CME 213 Final Project -- Milestone 3: GPU Kernels}
+\author{Nils Astrup Toft \and Sondre Rogde}
 \date{\today}
 
 \begin{document}
-\maketitle
+\maketitle\vspace{-1em}
 
 % ============================================================
-\section{Overview}
+\section{Summary of Progress}
 % ============================================================
 
-This milestone implements and benchmarks the custom CUDA kernels that form
-the compute-intensive core of our GPT-2-style transformer.  The goal is to
-replace na\"ive CPU or cuBLAS baselines with hand-written GPU kernels that
-exploit the memory hierarchy and parallelism of NVIDIA Turing GPUs (sm\_75,
-Quadro RTX 6000).
+We have implemented all six forward-pass CUDA kernels planned for this milestone: tiled GEMM, fused LayerNorm, online Softmax, GELU activation, cross-entropy loss, and Flash Attention. Each kernel is validated against a CPU reference and PyTorch ground truth, and a timing harness reports runtime, GFLOPS, and memory bandwidth. The host-side infrastructure (memory management, kernel launch wrappers, test suite, and plotting scripts) is complete.
 
-We implemented six kernels:
-\begin{enumerate}
-  \item \textbf{Tiled GEMM} --- shared-memory blocked matrix multiplication
-  \item \textbf{Fused LayerNorm} --- single-kernel mean, variance, and normalization
-  \item \textbf{Online Softmax} --- numerically stable row-wise softmax
-  \item \textbf{GELU Activation} --- exact erf-based formulation
-  \item \textbf{Cross-Entropy Loss} --- fused log-softmax and negative log-likelihood
-  \item \textbf{Flash Attention (forward)} --- SRAM-tiled attention without materializing the $N \times N$ score matrix
-\end{enumerate}
-
-Each kernel is validated against a CPU reference implementation and against
-PyTorch-generated ground-truth data before any performance measurement is
-reported.
+Relative to the Milestone 2 design, the full forward-pass kernel suite is done. Backward passes, the Adam optimizer kernel, mixed precision, and multi-GPU training are not yet started and are targeted for Milestones 4 and 5.
 
 % ============================================================
-\section{Implementation}
+\section{CUDA Kernels}
 % ============================================================
 
-\subsection{GEMM: Tiled Shared-Memory Multiplication}
-
-\paragraph{Algorithm.}
-Na\"ive GEMM has each thread read $K$ values from row $i$ of $A$ and $K$
-values from column $j$ of $B$ directly from global memory.  The arithmetic
-intensity is $\approx 1$ FLOP/byte for small tiles, leaving the GPU far
-below its compute peak.
-
-Our tiled kernel divides the $K$ dimension into tiles of width $T = 32$.
-Each thread block loads a $T \times T$ sub-matrix of $A$ and $B$ into shared
-memory cooperatively (one element per thread).  The inner product is then
-computed entirely in shared memory, achieving $T$ reuses per global load.
-Effective arithmetic intensity scales with $T$.
-
-\paragraph{Key CUDA concepts.}
-\begin{itemize}
-  \item \emph{Shared memory}: a 48--96\,KB per-SM scratchpad with $\sim$100$\times$
-    lower latency than global memory.  Declared with \texttt{\_\_shared\_\_}.
-  \item \emph{\_\_syncthreads()}: a block-wide barrier that ensures all threads
-    have finished filling the shared tile before any thread reads from it.
-  \item \emph{Coalesced loads}: mapping \texttt{threadIdx.x} to the contiguous
-    (column) dimension ensures that a warp's 32 loads collapse into a single
-    128-byte memory transaction.
-\end{itemize}
-
-\paragraph{Baseline comparison.}
-We compare against a CPU reference GEMM (\texttt{gemm\_cpu}) implemented as
-a plain triple-loop in C++.  The CPU time is reported alongside the GPU time
-for small correctness-check sizes, giving a direct measure of GPU speedup.
-
-\paragraph{Further optimization (future work).}
-Our tiled kernel computes one output element per thread.  A further
-improvement — \emph{register tiling} — has each thread compute a small
-$T_m \times T_n$ sub-tile ($4\times 4$ is typical), keeping those accumulators
-in registers throughout the K-loop rather than re-accessing shared memory.
-This reduces the $\nicefrac{\texttt{\_\_syncthreads()}}{\text{compute}}$ ratio
-and better hides shared-memory latency.  We implemented this technique in
-CME 213 HW4 (\texttt{tiledGEMM}), where each thread computed 8 output elements
-per block tile; adapting that kernel here is a planned follow-up.
-
-\subsection{Fused LayerNorm}
-
-LayerNorm normalizes each row of its input:
-\[
-  y_i = \gamma \cdot \frac{x_i - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta,
-  \quad
-  \mu = \frac{1}{H}\sum_j x_j,
-  \quad
-  \sigma^2 = \frac{1}{H}\sum_j (x_j - \mu)^2.
-\]
-
-\paragraph{Fusion.}
-A na\"ive implementation requires three separate kernel launches (mean,
-variance, normalize), each reading and writing the full $N \times H$ tensor.
-Our fused kernel computes everything in a single launch with three logical
-passes but only two global kernel dispatches:
-\begin{enumerate}
-  \item \emph{Pass 1}: each thread accumulates a partial sum; a shared-memory
-    tree reduction yields $\mu$.
-  \item \emph{Pass 2a}: reuse the shared buffer to accumulate $(x_j - \mu)^2$
-    and reduce to $\sigma^2$.  Computing variance this way (rather than the
-    algebraically equivalent $E[x^2] - E[x]^2$) avoids catastrophic
-    cancellation when $\mu$ is large.
-  \item \emph{Pass 2b}: normalize, scale, and shift in a single write pass.
-\end{enumerate}
-Total global memory traffic: 3 reads of $x$ + 1 write of $y$, versus 6
-reads + 3 writes for the na\"ive three-pass approach.
-
-\subsection{Softmax}
-
-We implement a three-pass online softmax:
-\begin{enumerate}
-  \item Find the row maximum $m_i = \max_j x_{ij}$ (for numerical stability).
-  \item Compute $\sum_j e^{x_{ij} - m_i}$.
-  \item Normalize: $y_{ij} = e^{x_{ij} - m_i} / \text{sum}$.
-\end{enumerate}
-Subtracting the row maximum before exponentiation prevents overflow.
-We use CUDA's fast intrinsic \texttt{\_\_expf} for throughput (small accuracy
-trade-off, within $5 \times 10^{-4}$ relative error versus double-precision).
-
-\subsection{GELU Activation}
-
-GELU is the standard activation for GPT-2's feed-forward layers:
-\[
-  \text{GELU}(x) = x \cdot \tfrac{1}{2}\bigl(1 + \operatorname{erf}(x / \sqrt{2})\bigr).
-\]
-We use the exact erf formulation (matching PyTorch's
-\texttt{F.gelu(x, approximate='none')}) via CUDA's \texttt{erff()} SFU
-intrinsic.  The kernel is purely pointwise with arithmetic intensity
-$\approx 0.75$\,FLOP/byte, making it firmly memory-bandwidth bound.
-
-\subsection{Cross-Entropy Loss}
-
-For each token we compute:
-\[
-  \mathcal{L}_n = -\log \frac{e^{\text{logits}[n, t_n]}}{\sum_v e^{\text{logits}[n,v]}},
-\]
-using the log-sum-exp trick (subtract the row maximum before computing
-softmax) to avoid floating-point overflow.  The kernel reads logits twice
-(one pass for the max, one for the sum of exponentials) and writes one loss
-scalar per token.
-
-\subsection{Flash Attention (Forward Pass)}
-
-Standard scaled dot-product attention requires materializing the $S \times S$
-score matrix per head, using $O(S^2)$ memory.  For long sequences this is the
-dominant memory bottleneck.
-
-Our Flash Attention implementation follows Dao et al.\ (2022).  The key idea
-is to tile the $Q$, $K$, $V$ matrices into SRAM-sized blocks and use an
-\emph{online} softmax update to accumulate the output $O$ incrementally,
-never writing the full score matrix to DRAM.  This reduces memory from
-$O(S^2)$ to $O(S)$ and improves memory bandwidth utilization substantially
-for long sequences.
-
-\paragraph{Online softmax.}
-As we stream $K$ and $V$ tiles into SRAM we maintain a running maximum
-$m^{(j)}$ and running sum $\ell^{(j)}$, applying a correction factor
-$e^{m^{(j-1)} - m^{(j)}}$ when the maximum changes.  The final output is
-rescaled once at the end of the loop.
-
-We support causal masking by zeroing out attention scores for keys at
-positions $> q$ before the softmax.
-
-% ============================================================
-\section{Correctness Validation}
-% ============================================================
-
-Each kernel is tested in two ways:
-
-\paragraph{CPU oracle.}
-A plain C++ reference implementation of each kernel runs on the host.
-The test compares the GPU output against the CPU output element-wise,
-reporting maximum absolute and relative error.  All kernels pass with
-relative error below their respective tolerance ($10^{-3}$ for GEMM and
-GELU, $10^{-4}$ for LayerNorm and cross-entropy, $5 \times 10^{-3}$ for
-Flash Attention).
-
-\paragraph{PyTorch comparison.}
-We generate reference inputs and outputs with PyTorch
-(\texttt{scripts/generate\_ref\_data.py}) and compare the saved \texttt{.bin}
-tensors against our GPU results.  This catches any systematic divergence from
-the numerically established ground truth.  Table~\ref{tab:pytorch_results}
-summarizes the PyTorch comparison results.
+Table~\ref{tab:kernels} summarizes all six kernels. We discuss the two most significant below.
 
 \begin{table}[h]
   \centering
   \small
-  \begin{tabular}{lrrl}
+  \begin{tabular}{lllp{4.2cm}}
     \toprule
-    \textbf{Kernel} & \textbf{Max abs err} & \textbf{Max rel err} & \textbf{Result} \\
+    \textbf{Kernel} & \textbf{Parallelization} & \textbf{GPU features} & \textbf{Optimization} \\
     \midrule
-    GEMM            & $0.000$ & $0.000$ & PASS \\
-    LayerNorm       & \textit{[placeholder]} & \textit{[placeholder]} & \textit{[after fix: PASS]} \\
-    Softmax         & $1.1 \times 10^{-8}$ & $6.4 \times 10^{-7}$ & PASS \\
-    GELU            & $4.8 \times 10^{-7}$ & $2.9 \times 10^{-4}$ & PASS \\
-    Cross-Entropy   & $9.5 \times 10^{-7}$ & $1.4 \times 10^{-7}$ & PASS \\
-    Flash Attention & $4.2 \times 10^{-7}$ & $1.1 \times 10^{-3}$ & PASS \\
+    Tiled GEMM       & $32{\times}32$ thread block per output tile & Shared memory, coalesced loads & $T{=}32$ tile reuse \\
+    Fused LayerNorm  & 1 block per row            & Shared-mem reduction & 2-pass fusion (mean then variance) \\
+    Online Softmax   & 1 block per row            & Shared-mem reduction & 3-pass; \texttt{\_\_expf} intrinsic \\
+    GELU             & 1-D grid, 1 thread/element & SFU                  & \texttt{erff()} intrinsic \\
+    Cross-Entropy    & 1 block per token          & Shared-mem reduction & Fused max + log-sum-exp \\
+    Flash Attention  & 1 block per query tile     & Shared memory        & Online softmax, $O(S{\cdot}D)$ memory \\
     \bottomrule
   \end{tabular}
-  \caption{PyTorch reference comparison (\texttt{test\_vs\_pytorch}).
-           GELU's non-zero relative error is expected: PyTorch evaluates
-           \texttt{erf} in double precision internally, while our kernel uses
-           CUDA's single-precision \texttt{erff()}, causing amplified relative
-           error near zero-valued outputs.}
-  \label{tab:pytorch_results}
+  \caption{Overview of the six implemented kernels.}
+  \label{tab:kernels}
 \end{table}
 
+\paragraph{Tiled GEMM.}
+Each $32{\times}32$ thread block loads a corresponding sub-tile of $A$ and $B$ into shared memory and accumulates the partial dot-product there. At large problem sizes (e.g., $M{=}N{=}K{=}4096$), the algorithmic arithmetic intensity is $\approx 683$\,FLOP/byte, well above the ridge point ($\approx 24$\,FLOP/byte), making the kernel compute-bound. The planned next improvement is register tiling, where each thread computes a $4{\times}4$ output sub-tile and keeps accumulators in the register file throughout the $K$-loop, reducing synchronization overhead.
+
+\paragraph{Flash Attention.}
+Following \cite{dao2022}, we tile $Q$, $K$, $V$ into SRAM-sized blocks and maintain a running maximum $m^{(j)}$ and sum $\ell^{(j)}$, applying a correction factor $e^{m^{(j-1)}-m^{(j)}}$ when the maximum changes. The full $S{\times}S$ score matrix is never written to DRAM, reducing memory from $O(S^2)$ to $O(S{\cdot}D)$. Causal masking is applied by zeroing scores for keys at positions $> q$ before each softmax update.
+
 % ============================================================
-\section{Performance Results}
-\label{sec:results}
+\section{C++ Wrapper and CPU Code}
 % ============================================================
 
-All measurements are taken on the Quadro RTX 6000 (Turing architecture,
-sm\_75, 16.31\,TFLOPS FP32, 672\,GB/s DRAM bandwidth).  Each reported time
-is the average of 10--20 kernel launches bracketed by CUDA events, with one
-untimed warm-up launch to amortize JIT compilation and first-touch costs.
+Each kernel is driven by a thin host wrapper that allocates device buffers via \texttt{cudaMalloc}, transfers inputs with \texttt{cudaMemcpy}, launches the kernel, and copies results back. Timing uses a single CUDA event pair bracketing 10--20 launches (kernel-dependent) with one untimed warm-up, implemented in \texttt{tests/test\_utils.hpp}. A plain triple-loop C++ reference implementation exists for each operation and is used for correctness checks and, in the case of GEMM, for direct CPU-vs-GPU speedup comparison.
 
-\subsection{Roofline Analysis}
+% ============================================================
+\section{Correctness Testing}
+% ============================================================
 
-Figure~\ref{fig:roofline} places each kernel on the roofline model.  The
-roofline ceiling for a kernel with arithmetic intensity $I$ (FLOP/byte) is:
-\[
-  \text{attainable} = \min\bigl(\text{peak compute},\; I \times \text{peak BW}\bigr).
-\]
-Kernels to the left of the ridge point ($\approx 24$\,FLOP/byte) are
-memory-bandwidth bound; those to the right are compute bound.
+Each kernel is validated in two ways: element-wise comparison against the CPU reference, and comparison against PyTorch-generated \texttt{.bin} tensors (\texttt{scripts/generate\_ref\_data.py}). GEMM, Softmax, GELU, Cross-Entropy, and Flash Attention all pass. LayerNorm passes CPU comparison but fails the PyTorch relative-error threshold at large hidden dimensions ($H{=}768$). This is a test sensitivity issue, not an algorithmic bug: absolute error stays below $4{\times}10^{-7}$ across all cases, but the affine output $\gamma \cdot z + \beta$ can land near zero for some elements (with random $\gamma,\beta \in [-1,1]$), causing the relative error metric to spike. The tolerance threshold will be relaxed to reflect the actual floating-point accuracy.
+
+% ============================================================
+\section{Preliminary Performance Analysis}
+% ============================================================
+
+All benchmarks run on the cluster. Figure~\ref{fig:roofline} shows the roofline plot and Table~\ref{tab:m3_perf} gives per-kernel numbers.
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.95\textwidth]{roofline}
-  \caption{Roofline model for all kernels on the Quadro RTX 6000
-           (16.31\,TFLOPS FP32, 672\,GB/s DRAM).
-           Dashed vertical lines show the gap between each kernel and the
-           theoretical ceiling for its arithmetic intensity.
-           Memory-bound kernels (LayerNorm, Softmax, GELU, Cross-Entropy)
-           cluster on the left bandwidth-limited slope; GEMM and Flash
-           Attention sit in the compute-limited flat region.
-           Generated by \texttt{scripts/plot\_perf.py}.}
+  \includegraphics[width=0.9\textwidth]{roofline}
+  \caption{Roofline model. LayerNorm, Softmax, GELU, and Cross-Entropy are memory-bandwidth bound; GEMM and Flash Attention are compute-bound at realistic problem sizes.}
   \label{fig:roofline}
 \end{figure}
 
-\subsection{Performance Table}
-
-% Auto-generated by scripts/plot_perf.py -- do not edit by hand.
-% Regenerate with: python3 scripts/plot_perf.py logs/run_<jobid>.out
 \input{results_tables/perf_table}
 
-\subsection{GEMM: GPU Speedup over CPU Baseline}
-
-The CPU reference (\texttt{gemm\_cpu}, plain triple-loop in C++) is measured
-alongside the GPU kernel for small correctness-check sizes.  The CPU time
-grows as $O(MNK)$ while the GPU kernel's parallelism makes it dramatically
-faster even at modest sizes:
-
-\begin{itemize}
-  \item At $M=N=K=256$, the CPU takes $\approx$\textit{[X]} ms versus the
-    GPU's $\approx$\textit{[X]} ms — a $\approx$\textit{[XX$\times$]} speedup.
-    \textit{(Fill in from SLURM log.)}
-  \item At $M=N=K=4096$, the CPU would take on the order of minutes; the
-    GPU completes in $\approx$\textit{[X]} ms at
-    $\approx$\textit{[XXXX]} GFLOPS.
-\end{itemize}
-
-The tiled kernel achieves these numbers by staging $32 \times 32$ sub-matrices
-of $A$ and $B$ into shared memory, reusing each loaded element 32 times before
-eviction.  This raises the effective arithmetic intensity far above the
-ridge point, making the kernel compute-bound rather than bandwidth-bound.
+The four memory-bound kernels are limited by the bandwidth ceiling. The main remaining lever is vectorized loads (\texttt{float4}) to reduce instruction overhead. GEMM and Flash Attention are compute-bound; the gap from the 16.3\,TFLOPS FP32 peak is primarily due to the single-output-per-thread tile strategy in GEMM (13.5\% of peak at $4096{\times}4096$). Register tiling and software pipelining (double-buffering with \texttt{cp.async}) are the planned next steps to close this gap.
 
 % ============================================================
-\section{Discussion}
+\section{Challenges and Next Steps}
 % ============================================================
 
-\subsection{Memory-Bound Kernels}
+\paragraph{Challenges.}
+LayerNorm required two separate shared-memory reduction passes to avoid catastrophic cancellation in the variance computation; the algebraically equivalent one-pass formula $E[x^2]-E[x]^2$ is numerically unstable when the mean is large. Flash Attention required careful per-tile bookkeeping of the running-max correction factor when streaming $K$ and $V$ blocks.
 
-LayerNorm, Softmax, GELU, and Cross-Entropy all have arithmetic intensity
-well below the ridge point.  Their performance ceiling is set by DRAM
-bandwidth (672\,GB/s), not the FP32 compute units.  The primary optimization
-levers are:
+\paragraph{Next steps and timeline.}
 
-\begin{itemize}
-  \item \textbf{Minimizing passes over the data.}  Fusing operations
-    (e.g., our two-pass LayerNorm) reduces the number of global memory
-    round-trips.
-  \item \textbf{Vectorized loads.}  Replacing four scalar \texttt{float}
-    loads with a single \texttt{float4} instruction reduces instruction
-    overhead; this is a near-term follow-up.
-  \item \textbf{Occupancy.}  High occupancy (many resident warps per SM)
-    allows the hardware to hide global-memory latency.  For memory-bound
-    kernels, maximizing occupancy is the main path to closing the gap
-    between achieved and peak bandwidth.
-\end{itemize}
+\begin{center}
+\small
+\begin{tabular}{@{}lp{10.5cm}@{}}
+\toprule
+\textbf{Week} & \textbf{Tasks} \\
+\midrule
+Wk 7 (May 12--16) & Flash Attention backward; LayerNorm tolerance fix; full backward pass validated against PyTorch autograd. \\
+Wk 8 (May 19--23) & Fused cross-entropy and Adam; end-to-end single-GPU training confirmed; register tiling for GEMM. \\
+Wk 9 (May 26--30) & MPI Ring All-Reduce; multi-GPU training; scaling benchmarks; POS variant. \\
+Wk 10 (Jun 1--8)  & Communication experiments; task-vs-data comparison; 6-page final report. \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\subsection{Compute-Bound Kernels}
+A structural challenge is that this project overlaps in content with the course homeworks, and we do not yet have access to all remaining assignments. We will need to remain adaptive as new homeworks are released, adjusting our implementation plan accordingly.
 
-GEMM and Flash Attention are compute-bound at realistic problem sizes
-(after tiling).  The gap between achieved GFLOPS and the 16.3\,TFLOPS
-ceiling is explained by:
-
-\begin{itemize}
-  \item \textbf{Register tiling.}  Our tiled GEMM uses a $32 \times 32$
-    thread block with one output element per thread.  Moving to register
-    tiling (each thread computes multiple outputs, keeping accumulators in
-    the register file) reduces the
-    $\nicefrac{\texttt{\_\_syncthreads()}}{\text{compute}}$ ratio.  We
-    implemented this in CME 213 HW4 (\texttt{tiledGEMM}: 128 threads, 8
-    outputs per thread per $32 \times 32$ block tile); adapting that kernel
-    here is the planned next step.
-  \item \textbf{No software pipelining.}  Loading the next tile while
-    computing the current one (\texttt{cp.async} / double-buffering) is
-    required to approach peak on Ampere and above; it also helps on Turing.
-  \item \textbf{Tensor Cores.}  Turing's Tensor Core units deliver
-    $\sim$125\,TFLOPS for FP16 matrix operations, more than $7\times$ the
-    FP32 scalar throughput.  Adopting mixed-precision (BF16/FP16 compute
-    with FP32 accumulation) is planned for Milestone 4.
-\end{itemize}
-
-\subsection{Flash Attention}
-
-Flash Attention avoids materializing the $S \times S$ attention matrix, which
-for $S=512$ and 8 heads would require $8 \times 512^2 \times 4$\,bytes
-$= 8$\,MB per batch element.  The SRAM tiling strategy keeps working memory
-proportional to $S \cdot D$ rather than $S^2$, making it feasible for long
-sequences.
-
-The achieved GFLOPS for Flash Attention should be compared against the
-na\"ive attention (which would write the score matrix to DRAM), not against
-the raw GEMM kernel, because the memory savings change the roofline ceiling.
-A na\"ive attention comparison is left as a follow-up experiment.
-
-% ============================================================
-\section{Future Work}
-% ============================================================
-
-\begin{enumerate}
-  \item \textbf{Register tiling for GEMM} --- adapt the \texttt{tiledGEMM}
-    kernel from CME 213 HW4 (128 threads, 8 outputs per thread) to our
-    row-major convention.  This reduces synchronization overhead and keeps
-    accumulators in registers, the primary bottleneck at our current
-    $\sim$\textit{XX}\% of compute peak.
-  \item \textbf{Vectorized loads (float4)} --- reduce instruction count for
-    memory-bound kernels by issuing 128-bit loads.
-  \item \textbf{Mixed precision (BF16/FP32)} --- switch storage and compute
-    to BF16 with FP32 accumulation; required before the full training loop.
-  \item \textbf{Backward passes} --- implement gradients for GEMM, LayerNorm,
-    GELU, and Flash Attention (Milestone 4).
-  \item \textbf{Fused GEMM + GELU} --- eliminate the intermediate HBM
-    round-trip between the linear projection and the activation.
-\end{enumerate}
-
-% ============================================================
-\section{Build and Run Instructions}
-% ============================================================
-
-\begin{lstlisting}[language=bash, caption={Building and running the kernel tests.}]
-# On the SLURM cluster (gpu-turing partition, Quadro RTX 6000):
-sbatch run.sh
-
-# After the job completes, generate the roofline plot and LaTeX table:
-python3 scripts/plot_perf.py logs/run_<jobid>.out
-# Outputs: reports/roofline.pdf, reports/perf_table.tex
-
-# To regenerate PyTorch reference data (run once, on a node with PyTorch):
-python3 scripts/generate_ref_data.py
-\end{lstlisting}
+\begin{thebibliography}{1}
+\bibitem{dao2022}
+T.\ Dao, D.\ Fu, S.\ Ermon, A.\ Rudra, and C.\ R\'{e}.
+FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+In \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+\end{thebibliography}
 
 \end{document}
