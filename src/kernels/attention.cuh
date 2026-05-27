@@ -1,26 +1,23 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Public API: Flash Attention forward (FP32, single-GPU).
+// Public API: Flash Attention forward + naive attention backward (FP32).
 //
-// Inputs (all device pointers, row-major, FP32):
-//   Q, K, V : shape (B, H, S, D)
-// Output:
-//   O       : shape (B, H, S, D)
+// Forward (Flash Attention — O(S*D) memory):
+//   Inputs  Q, K, V : (B, H, S, D)
+//   Output  O       : (B, H, S, D)
+//   scale: pre-scale factor applied to QK^T (typically 1/sqrt(D))
+//   causal: if true, token i only attends to positions 0..i
 //
-//   B : batch size
-//   H : number of attention heads
-//   S : sequence length
-//   D : head dimension (must be one of the values supported by the
-//       dispatcher in attention.cu -- currently 32, 64, 96, 128)
+// Backward (naive — O(S^2) memory):
+//   Inputs : Q, K, V from forward; dO upstream gradient; scale, causal flag
+//   Outputs: dQ, dK, dV  each (B, H, S, D)
+//   The backward materializes the full S×S attention weight matrix P per
+//   (batch, head). This is correct but memory-heavy for long sequences.
+//   A memory-efficient Flash Attention backward is planned for Milestone 5.
 //
-// scale : multiplicative factor applied to QK^T before the softmax.
-//         Standard attention uses 1/sqrt(D); pass it explicitly so callers
-//         can experiment with other choices.
-// causal: if true, each query position only attends to keys at positions
-//         <= its own (autoregressive language modelling).
-//
-// The output is written in-place to O; Q, K, V are not modified.
+//   Temp buffers P and dP (each B*H*S*S floats) are allocated and freed
+//   internally by launch_attention_backward.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -32,3 +29,14 @@ void launch_flash_attention_forward(const float* dQ,
                                     int B, int H, int S, int D,
                                     float scale, bool causal,
                                     cudaStream_t stream = 0);
+
+void launch_attention_backward(const float* Q,
+                               const float* K,
+                               const float* V,
+                               const float* dO,
+                               float* dQ,
+                               float* dK,
+                               float* dV,
+                               int B, int H, int S, int D,
+                               float scale, bool causal,
+                               cudaStream_t stream = 0);

@@ -1,5 +1,8 @@
 #include "kernels/attention.cuh"
+#include "kernels/gemm.cuh"
 #include "utils/cuda_check.hpp"
+#include <cstdlib>   // malloc / free
+#include <cstdio>
 
 // ===========================================================================
 // Flash Attention forward (FP32).
@@ -262,4 +265,212 @@ void launch_flash_attention_forward(const float* dQ, const float* dK,
             std::abort();
     }
     CUDA_CHECK_LAST();
+}
+
+// ===========================================================================
+// Naive attention backward — materializes the S×S score matrix P.
+//
+// Strategy (per (batch, head) pair):
+//   Forward re-computation:
+//     A_raw[i,j] = (Q[i] · K[j]) * scale
+//     A[i,j]     = softmax_i(A_raw)                  → P buffer
+//   Backward steps:
+//     dV    = P^T  × dO                              (gemm_tn)
+//     dP    = dO   × V^T                             (gemm_nt)
+//     dS    = softmax_backward(P, dP) * scale        (row-parallel kernel)
+//     dQ    = dS   × K                               (gemm_tiled)
+//     dK    = dS^T × Q                               (gemm_tn)
+//
+// Memory: two temp buffers of B*H*S*S floats are allocated and freed here.
+// For B=8, H=8, S=512: 2 × 8×8×512²×4 = 128 MB — large but manageable.
+// ===========================================================================
+
+// ---- Kernel 1: re-compute attention weights P for one (b,h) slice ----
+// Grid: (S,) one block per query row i; Block: (256,) threads
+// Each block: dot(Q[i], K[j]) * scale for all j, causal mask, then softmax
+template <int D>
+__global__ void attention_weights_kernel(const float* __restrict__ Q,  // (S, D) one bh
+                                         const float* __restrict__ K,  // (S, D) one bh
+                                         float*       __restrict__ P,  // (S, S) one bh
+                                         int S, float scale, bool causal) {
+    constexpr int SMEM_BLOCK = 256;
+    int i   = blockIdx.x;
+    int tid = threadIdx.x;
+    if (i >= S) return;
+
+    // Cache query row in shared memory (D ≤ 128 → always fits)
+    __shared__ float q_smem[D];
+    if (tid < D) q_smem[tid] = Q[i * D + tid];
+    __syncthreads();
+
+    float* p_row = P + i * S;
+
+    // Compute raw scores for all j
+    for (int j = tid; j < S; j += SMEM_BLOCK) {
+        bool masked = causal && (j > i);
+        if (masked) {
+            p_row[j] = -INFINITY;
+        } else {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) dot += q_smem[d] * K[j * D + d];
+            p_row[j] = dot * scale;
+        }
+    }
+    __syncthreads();
+
+    // Row-wise softmax
+    __shared__ float s_buf[SMEM_BLOCK];
+
+    float lmax = -INFINITY;
+    for (int j = tid; j < S; j += SMEM_BLOCK) lmax = fmaxf(lmax, p_row[j]);
+    s_buf[tid] = lmax;
+    __syncthreads();
+    for (int s = SMEM_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) s_buf[tid] = fmaxf(s_buf[tid], s_buf[tid + s]);
+        __syncthreads();
+    }
+    float row_max = s_buf[0];
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (int j = tid; j < S; j += SMEM_BLOCK) {
+        float v = (p_row[j] == -INFINITY) ? 0.0f : __expf(p_row[j] - row_max);
+        p_row[j] = v;
+        lsum += v;
+    }
+    s_buf[tid] = lsum;
+    __syncthreads();
+    for (int s = SMEM_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) s_buf[tid] += s_buf[tid + s];
+        __syncthreads();
+    }
+    float row_sum = s_buf[0];
+
+    for (int j = tid; j < S; j += SMEM_BLOCK) p_row[j] /= row_sum;
+}
+
+// ---- Kernel 2: softmax backward + scale ----
+// dS_ij = scale * P_ij * (dP_ij - sum_k P_ik * dP_ik)
+// Writes result into dS (may be the same buffer as dP)
+// Grid: (S,) one block per row; Block: (256,)
+__global__ void softmax_backward_kernel(const float* __restrict__ P,   // (S, S)
+                                        const float* __restrict__ dP,  // (S, S)
+                                        float*       __restrict__ dS,  // (S, S)
+                                        int S, float scale) {
+    constexpr int SMEM_BLOCK = 256;
+    int i   = blockIdx.x;
+    int tid = threadIdx.x;
+    if (i >= S) return;
+
+    const float* p_row  = P  + i * S;
+    const float* dp_row = dP + i * S;
+    float*       ds_row = dS + i * S;
+
+    // Reduce: row_dot = sum_j P_ij * dP_ij
+    __shared__ float s_buf[SMEM_BLOCK];
+    float local_dot = 0.0f;
+    for (int j = tid; j < S; j += SMEM_BLOCK) local_dot += p_row[j] * dp_row[j];
+    s_buf[tid] = local_dot;
+    __syncthreads();
+    for (int s = SMEM_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) s_buf[tid] += s_buf[tid + s];
+        __syncthreads();
+    }
+    float row_dot = s_buf[0];
+
+    // Write dS (scale already folded in)
+    for (int j = tid; j < S; j += SMEM_BLOCK) {
+        ds_row[j] = scale * p_row[j] * (dp_row[j] - row_dot);
+    }
+}
+
+// ---- Dispatcher for attention_weights_kernel ----
+static void launch_attention_weights(const float* Q, const float* K,
+                                     float* P, int S, int D,
+                                     float scale, bool causal,
+                                     cudaStream_t stream) {
+    dim3 grid(S);
+    dim3 block(256);
+    switch (D) {
+        case 32:  attention_weights_kernel< 32><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
+        case 64:  attention_weights_kernel< 64><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
+        case 96:  attention_weights_kernel< 96><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
+        case 128: attention_weights_kernel<128><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
+        default:
+            std::fprintf(stderr, "Attention backward: unsupported D=%d\n", D);
+            std::abort();
+    }
+    CUDA_CHECK_LAST();
+}
+
+void launch_attention_backward(const float* Q, const float* K, const float* V,
+                               const float* dO,
+                               float* dQ, float* dK, float* dV,
+                               int B, int H, int S, int D,
+                               float scale, bool causal,
+                               cudaStream_t stream) {
+    int BH  = B * H;
+    int SD  = S * D;
+    int SS  = S * S;
+
+    // Allocate temp buffers for P and dP (each BH × S × S floats)
+    float* P  = nullptr;
+    float* dP = nullptr;
+    CUDA_CHECK(cudaMalloc(&P,  static_cast<size_t>(BH) * SS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dP, static_cast<size_t>(BH) * SS * sizeof(float)));
+
+    // Step 1: compute attention weights P for all (b,h) pairs.
+    // Grid: (S, BH) — one block per (query row, batch-head)
+    // We run attention_weights_kernel per bh in a loop to keep code simple.
+    for (int bh = 0; bh < BH; ++bh) {
+        launch_attention_weights(Q + bh * SD, K + bh * SD,
+                                 P + bh * SS,
+                                 S, D, scale, causal, stream);
+    }
+
+    // Step 2: dV = P^T × dO   →  dV[bh] = P[bh]^T × dO[bh]
+    // P stored as (S, S), P^T conceptually. launch_gemm_tn: C = A^T B, A stored K×M
+    // Here: A = P (stored S×S), B = dO (S×D), C = dV (S×D)
+    // M=S, N=D, K=S
+    for (int bh = 0; bh < BH; ++bh) {
+        launch_gemm_tn(P + bh * SS, dO + bh * SD, dV + bh * SD, S, D, S, stream);
+    }
+
+    // Step 3: dP = dO × V^T   →  dP[bh] = dO[bh] × V[bh]^T
+    // launch_gemm_nt: C = A × B^T, B stored N×K
+    // A = dO (S×D), B = V (stored S×D = N×K), C = dP (S×S)
+    // M=S, N=S, K=D
+    for (int bh = 0; bh < BH; ++bh) {
+        launch_gemm_nt(dO + bh * SD, V + bh * SD, dP + bh * SS, S, S, D, stream);
+    }
+
+    // Step 4: dS = softmax_backward(P, dP) * scale
+    // We write back into dP (safe: P is still unmodified, needed only for this step)
+    // After this, dP buffer holds dS = dL/d(A_raw) = dL/dA * scale
+    for (int bh = 0; bh < BH; ++bh) {
+        dim3 grid(S);
+        dim3 block(256);
+        softmax_backward_kernel<<<grid, block, 0, stream>>>(
+            P + bh * SS, dP + bh * SS, dP + bh * SS, S, scale);
+        CUDA_CHECK_LAST();
+    }
+
+    // Step 5: dQ = dS × K
+    // dS (= dP buffer) is (S, S); K is (S, D)
+    // M=S, N=D, K=S
+    for (int bh = 0; bh < BH; ++bh) {
+        launch_gemm_tiled(dP + bh * SS, K + bh * SD, dQ + bh * SD, S, D, S, stream);
+    }
+
+    // Step 6: dK = dS^T × Q
+    // launch_gemm_tn: C = A^T B, A stored K×M
+    // A = dS (stored S×S), B = Q (S×D), C = dK (S×D)
+    // M=S, N=D, K=S
+    for (int bh = 0; bh < BH; ++bh) {
+        launch_gemm_tn(dP + bh * SS, Q + bh * SD, dK + bh * SD, S, D, S, stream);
+    }
+
+    CUDA_CHECK(cudaFree(P));
+    CUDA_CHECK(cudaFree(dP));
 }

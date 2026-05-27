@@ -75,14 +75,22 @@ def gen_gemm():
 def gen_layernorm():
     print("\n[LayerNorm]  N=32  H=256")
     N, H = 32, 256
-    x     = torch.randn(N, H, dtype=DTYPE)
-    gamma = torch.randn(H,    dtype=DTYPE)
-    beta  = torch.randn(H,    dtype=DTYPE)
+    x     = torch.randn(N, H, dtype=DTYPE, requires_grad=True)
+    gamma = torch.randn(H,    dtype=DTYPE, requires_grad=True)
+    beta  = torch.randn(H,    dtype=DTYPE, requires_grad=True)
     y = F.layer_norm(x, [H], gamma, beta, eps=1e-5)
-    save("layernorm_x.bin",     x)
-    save("layernorm_gamma.bin", gamma)
-    save("layernorm_beta.bin",  beta)
-    save("layernorm_y.bin",     y)
+    save("layernorm_x.bin",     x.detach())
+    save("layernorm_gamma.bin", gamma.detach())
+    save("layernorm_beta.bin",  beta.detach())
+    save("layernorm_y.bin",     y.detach())
+
+    # Backward: random upstream gradient
+    dy = torch.randn_like(y)
+    y.backward(dy)
+    save("layernorm_dy.bin",     dy)
+    save("layernorm_dx.bin",     x.grad)
+    save("layernorm_dgamma.bin", gamma.grad)
+    save("layernorm_dbeta.bin",  beta.grad)
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +112,15 @@ def gen_gelu():
     print("\n[GELU]  N=4096")
     N = 4096
     x = torch.randn(N, dtype=DTYPE)
+    x.requires_grad_(True)
     y = F.gelu(x, approximate="none")
-    save("gelu_x.bin", x)
-    save("gelu_y.bin", y)
+    save("gelu_x.bin", x.detach())
+    save("gelu_y.bin", y.detach())
+
+    # Backward: upstream gradient = ones, dx = gelu'(x)
+    dy = torch.ones_like(y)
+    y.backward(dy)
+    save("gelu_dx.bin", x.grad)
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +130,22 @@ def gen_gelu():
 def gen_cross_entropy():
     print("\n[CrossEntropy]  N=32  V=512")
     N, V = 32, 512
-    logits  = torch.randn(N, V, dtype=DTYPE)
+    logits  = torch.randn(N, V, dtype=DTYPE, requires_grad=True)
     targets = torch.randint(0, V, (N,), dtype=torch.int32)
     losses  = F.cross_entropy(logits, targets.long(), reduction="none")
-    save("cross_entropy_logits.bin",  logits)
+    save("cross_entropy_logits.bin",  logits.detach())
     # Save targets as int32 so C++ can fread() them into int arrays directly.
     np.array(targets.numpy(), dtype=np.int32).tofile(
         os.path.join(OUT_DIR, "cross_entropy_targets.bin"))
     print(f"  wrote {os.path.join(OUT_DIR, 'cross_entropy_targets.bin')}"
           f"  shape={targets.shape}  dtype=int32")
-    save("cross_entropy_losses.bin",  losses)
+    save("cross_entropy_losses.bin",  losses.detach())
+
+    # Backward: dlosses = 1/N (mean-normalized, same as the trainer)
+    dlosses = torch.full_like(losses, 1.0 / N)
+    losses.backward(dlosses)
+    save("cross_entropy_dlosses.bin", dlosses)
+    save("cross_entropy_dlogits.bin", logits.grad)
 
 
 # ---------------------------------------------------------------------------
@@ -137,19 +157,27 @@ def gen_attention():
     B, H, S, D = 2, 4, 64, 64
     scale = D ** -0.5
 
-    Q = torch.randn(B, H, S, D, dtype=DTYPE)
-    K = torch.randn(B, H, S, D, dtype=DTYPE)
-    V = torch.randn(B, H, S, D, dtype=DTYPE)
+    Q = torch.randn(B, H, S, D, dtype=DTYPE, requires_grad=True)
+    K = torch.randn(B, H, S, D, dtype=DTYPE, requires_grad=True)
+    V = torch.randn(B, H, S, D, dtype=DTYPE, requires_grad=True)
 
     # scaled_dot_product_attention with is_causal=True matches our kernel's
     # causal masking (each query only attends to keys at positions <= itself).
     O = F.scaled_dot_product_attention(Q, K, V,
                                        scale=scale,
                                        is_causal=True)
-    save("attention_Q.bin", Q)
-    save("attention_K.bin", K)
-    save("attention_V.bin", V)
-    save("attention_O.bin", O)
+    save("attention_Q.bin", Q.detach())
+    save("attention_K.bin", K.detach())
+    save("attention_V.bin", V.detach())
+    save("attention_O.bin", O.detach())
+
+    # Backward: random upstream gradient
+    dO = torch.randn_like(O)
+    O.backward(dO)
+    save("attention_dO.bin", dO)
+    save("attention_dQ.bin", Q.grad)
+    save("attention_dK.bin", K.grad)
+    save("attention_dV.bin", V.grad)
 
 
 # ---------------------------------------------------------------------------
