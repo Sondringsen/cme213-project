@@ -30,7 +30,7 @@ static void gelu_backward_cpu(const float* dy, const float* x,
     for (int i = 0; i < n; ++i) {
         float xi   = x[i];
         float phi  = 0.5f * (1.0f + std::erff(xi * kInvSqrt2));
-        float dphi = kInvSqrt2Pi * std::expf(-0.5f * xi * xi);
+        float dphi = kInvSqrt2Pi * expf(-0.5f * xi * xi);
         dx_out[i]  = dy[i] * (phi + xi * dphi);
     }
 }

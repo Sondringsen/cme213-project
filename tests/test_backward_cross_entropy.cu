@@ -39,11 +39,11 @@ static void cross_entropy_backward_cpu(
 
         // Sum of exp(logit - max)
         float Z = 0.0f;
-        for (int j = 0; j < V; ++j) Z += std::expf(logits_n[j] - row_max);
+        for (int j = 0; j < V; ++j) Z += expf(logits_n[j] - row_max);
 
         // Write dlogits
         for (int j = 0; j < V; ++j) {
-            float softmax_j = std::expf(logits_n[j] - row_max) / Z;
+            float softmax_j = expf(logits_n[j] - row_max) / Z;
             float indicator = (j == tgt) ? 1.0f : 0.0f;
             dlogits_n[j] = dloss * (softmax_j - indicator);
         }

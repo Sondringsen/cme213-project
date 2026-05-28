@@ -68,7 +68,7 @@ static void attention_backward_cpu(
             float sum = 0.0f;
             for (int j = 0; j < S; ++j) {
                 float v = (P[i*S+j] == -INFINITY) ? 0.0f
-                                                  : std::expf(P[i*S+j] - row_max);
+                                                  : expf(P[i*S+j] - row_max);
                 P[i*S+j] = v;
                 sum      += v;
             }
@@ -116,7 +116,7 @@ static void attention_backward_cpu(
 // One test case.
 // ---------------------------------------------------------------------------
 static int run_case(int B, int H, int S, int D, bool causal) {
-    float scale = 1.0f / std::sqrtf(static_cast<float>(D));
+    float scale = 1.0f / sqrtf(static_cast<float>(D));
     int total   = B * H * S * D;
 
     std::vector<float> hQ(total), hK(total), hV(total), hdO(total);

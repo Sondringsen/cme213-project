@@ -54,7 +54,7 @@ static void layernorm_backward_cpu(
             var += d * d;
         }
         var /= H;
-        float rstd = 1.0f / std::sqrtf(var + eps);
+        float rstd = 1.0f / sqrtf(var + eps);
 
         // Two reductions (with gamma weights — see layernorm.cu comment)
         float sum_dy     = 0.0f;
