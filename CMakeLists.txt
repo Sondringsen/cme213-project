@@ -24,6 +24,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --expt-extend
 # Optional MPI support
 # ---------------------------------------------------------------------------
 find_package(MPI QUIET)
+find_package(CUDAToolkit QUIET)
 if(MPI_FOUND)
     message(STATUS "MPI found — building distributed training target")
     add_compile_definitions(MPI_ENABLED)
@@ -107,4 +108,10 @@ if(MPI_FOUND)
     add_executable(train_distributed src/main_distributed.cu)
     target_link_libraries(train_distributed PRIVATE llm MPI::MPI_CXX)
     target_include_directories(train_distributed PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    # Link nvToolsExt when available so NVTX range markers appear in Nsight timelines.
+    if(CUDAToolkit_FOUND AND TARGET CUDA::nvToolsExt)
+        target_link_libraries(train_distributed PRIVATE CUDA::nvToolsExt)
+        target_compile_definitions(train_distributed PRIVATE WITH_NVTX)
+        message(STATUS "nvToolsExt found — NVTX annotations enabled for train_distributed")
+    endif()
 endif()

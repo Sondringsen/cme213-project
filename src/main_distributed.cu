@@ -32,6 +32,17 @@
 #include <vector>
 #include <chrono>
 
+// NVTX range markers so Nsight Systems shows named regions in the timeline.
+// Compiled out when nvToolsExt is not available (no overhead in that case).
+#ifdef WITH_NVTX
+#  include <nvToolsExt.h>
+#  define NVTX_PUSH(name) nvtxRangePushA(name)
+#  define NVTX_POP()      nvtxRangePop()
+#else
+#  define NVTX_PUSH(name) ((void)0)
+#  define NVTX_POP()      ((void)0)
+#endif
+
 // ---------------------------------------------------------------------------
 // Synthetic batch generator.  Every call produces a new random batch so that
 // the model actually has something to train on (loss should decrease over time
@@ -116,6 +127,10 @@ int main(int argc, char** argv) {
     double total_comm_time = 0.0;
 
     for (int step = 1; step <= n_steps; ++step) {
+        char step_label[32];
+        std::snprintf(step_label, sizeof(step_label), "step_%d", step);
+        NVTX_PUSH(step_label);
+
         // Generate the same global batch on every rank (same seed), then
         // slice the local portion.  Using the step as the seed means each
         // step has a fresh batch.
@@ -135,15 +150,21 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
 
         // a. Local forward + backward
+        NVTX_PUSH("forward_backward");
         float loss = trainer.forward_backward(d_ids, d_targets);
+        NVTX_POP();
 
         // b. Gradient all-reduce (timed separately for the scaling study)
         auto t_comm0 = std::chrono::steady_clock::now();
+        NVTX_PUSH("allreduce");
         allreduce_gradients(model);
+        NVTX_POP();
         auto t_comm1 = std::chrono::steady_clock::now();
 
         // c. Adam step (identical on all ranks)
+        NVTX_PUSH("optimizer");
         trainer.optimizer_step();
+        NVTX_POP();
 
         auto t1 = std::chrono::steady_clock::now();
 
@@ -151,6 +172,8 @@ int main(int argc, char** argv) {
         double comm_ms = std::chrono::duration<double, std::milli>(t_comm1 - t_comm0).count();
         total_step_time += step_ms;
         total_comm_time += comm_ms;
+
+        NVTX_POP(); // step_N
 
         if (rank == 0) {
             std::printf("step %3d | loss %.4f | step %.1f ms | comm %.1f ms (%.1f%%)\n",

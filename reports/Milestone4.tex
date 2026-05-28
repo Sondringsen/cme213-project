@@ -1,0 +1,110 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{microtype}
+\usepackage{parskip}
+\setlength{\parskip}{4pt plus 1pt minus 1pt}
+
+\graphicspath{{../plots/}{plots/}}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{\vspace{-2em}CME 213 Final Project -- Milestone 4: Distributed Training}
+\author{Nils Astrup Toft \and Sondre Rogde}
+\date{\today}
+
+\begin{document}
+\maketitle\vspace{-1em}
+
+% ============================================================
+\section{Summary of Progress}
+% ============================================================
+
+Since Milestone 3 we completed the entire single-GPU training step and added MPI data parallelism. New CUDA kernels: backward passes for LayerNorm, GELU, Cross-Entropy, and (naive $O(S^2)$) Attention; an embedding gather / atomic-scatter pair; a fused Adam update; and the layout-reshape and pointwise helpers used by the residual paths. New host code: a layered C++ abstraction (\texttt{Linear}, \texttt{LayerNormLayer}, \texttt{EmbeddingLayer}, \texttt{MultiHeadAttention}, \texttt{TransformerBlock}), the \texttt{GPT2} model that assembles them, a \texttt{Trainer} that drives forward $\to$ CE loss $\to$ backward $\to$ Adam, and an MPI layer with \texttt{broadcast\_weights}, \texttt{allreduce\_gradients}, and \texttt{scatter\_batch}. The single-GPU training step is end-to-end working. Data-parallel training on up to 4 GPUs is working. Not yet started, and targeted for the final report, a real dataset (WikiText-2), and a fused all-reduce.
+
+% ============================================================
+\section{Distributed Algorithm and Data Decomposition}
+% ============================================================
+
+We use \textbf{data parallelism with replicated parameters}: every rank holds a full copy of the model and processes \texttt{local\_B = total\_B / n\_ranks} sequences of the global mini-batch. After each rank's backward pass, gradients are averaged with \texttt{MPI\_Allreduce}; every rank then runs an identical Adam step, so weights remain bit-identical across ranks without any further synchronization. We considered \emph{tensor / model parallelism} but rejected it: the model fits comfortably on one Quadro RTX 6000 (24~GB), so replication is essentially free.
+
+% ============================================================
+\section{MPI Implementation}
+% ============================================================
+
+Three collectives are used. (1) \texttt{MPI\_Bcast} runs once at startup in \texttt{broadcast\_weights} to copy rank 0's parameters to every rank; we additionally use a deterministic per-parameter seed during \texttt{init\_parameters}, so the broadcast is in practice a defensive sanity check rather than the real source of synchronization. (2) \texttt{MPI\_Allreduce} (\texttt{MPI\_SUM}, in-place) is called once \emph{per parameter tensor} after each backward pass; the host-side scaling by $1/n_{\text{ranks}}$ averages the result. (3) \texttt{scatter\_batch} is a host-side slice (no MPI call) since each rank generates the same global batch deterministically from \texttt{(seed, step)} and reads only its own contiguous slice.
+
+We do not currently use CUDA-aware MPI: each Allreduce stages through host memory (\texttt{cudaMemcpy} D$\to$H, then \texttt{MPI\_Allreduce}, then H$\to$D). There is also no overlap with computation, the trainer serializes forward $\to$ backward $\to$ all-reduce $\to$ Adam. Both choices were intentional: they kept the implementation compact while exposing the inefficiency clearly in the scaling study below.
+
+% ============================================================
+\section{C++ Wrapper and CUDA Integration}
+% ============================================================
+
+\texttt{mpi\_init} calls \texttt{MPI\_Init}, then assigns one GPU per rank with \texttt{cudaSetDevice(rank \% n\_devices)} so each rank operates on a distinct device within the SLURM allocation. Tensors are allocated with \texttt{cudaMalloc}; the \texttt{GPT2} model owns every parameter and exposes a flat \texttt{param\_grads()} list of \texttt{(param, grad, n\_elements)} structs in a deterministic order, so the MPI layer iterates parameters without needing to know the model topology. Kernel changes required for the distributed setting were minimal: we added \texttt{init\_parameters} (Xavier-uniform for linear weights, $\mathcal{N}(0,0.02)$ for embeddings, $\gamma{=}1,\beta{=}0$ for LayerNorm) because Milestone~3 left weights as uninitialized GPU memory. We also fixed a bug in the LayerNorm where $\gamma$ must appear inside both reduction sums, not factored out as a scalar.
+
+% ============================================================
+\section{Correctness Testing}
+% ============================================================
+
+Each kernel is independently validated against a plain-C++ CPU oracle (forward kernels also against PyTorch \texttt{.bin} references) using the standard combined criterion $\text{rel} \leq 10^{-3}$ or $\text{abs} \leq 10^{-5}$. The absolute guard handles the FP32 artefact where near-zero reference outputs would otherwise spike the relative metric. All forward and backward kernel tests pass on the cluster under this criterion. Three distributed end-to-end checks then hold. \emph{Structural:} \texttt{ranks=4, local\_B=4} is measured in both sweeps and the step times agree to 1.4\% (54.26 vs 53.49\,ms). \emph{Determinism:} at fixed \texttt{local\_B=4}, the step-1 loss is bit-identical across $\{1,2,4\}$ ranks (6.6030 in all three weak runs), verifying correct broadcast and a deterministic forward; values diverge from step 2 onward because \texttt{total\_B} differs. \emph{Convergence:} all configurations drive the loss toward the random-token entropy floor $\log V \approx 6.24$, with the step-20 cross-configuration spread shrinking to $\sim$$10^{-3}$.
+
+% ============================================================
+\section{Performance, Scaling, and Profiling}\label{sec:perf}
+% ============================================================
+
+All measurements use $n_{\text{layers}}{=}4$, $C{=}256$, $S{=}128$, $V{=}512$, averaging over 20 timed steps (first step included; its $\sim$$7\,$ms JIT/allocator cost contributes $\sim$$0.4\,$ms to the average). Per-step time is measured with \texttt{std::chrono::steady\_clock} on rank~0; the host-staged \texttt{allreduce\_gradients} is timed separately to isolate the communication component. Figure~\ref{fig:scaling} and Table~\ref{tab:scaling} report the result.
+
+\begin{figure}[!htbp]
+  \centering
+  \includegraphics[width=0.75\textwidth]{scaling}
+  \caption{Step-time breakdown into compute (fwd + bwd + Adam) and communication (Allreduce + host staging). $\eta$ is parallel efficiency: $T_1/(n\,T_n)$ for strong, $T_1/T_n$ for weak. Communication is approximately constant across the sweep, identifying it as the latency-bound bottleneck.}
+  \label{fig:scaling}
+\end{figure}
+
+\begin{table}[!htbp]
+  \centering
+  \small
+  \begin{tabular}{lrrrrrrr}
+    \toprule
+    Sweep  & ranks & \texttt{local\_B} & step (ms) & comm (ms) & comm \% & speedup & efficiency \\
+    \midrule
+    strong & 1 & 16 & 75.97 & 0.00  & 0.0  & 1.00$\times$ & 100\% \\
+    strong & 2 & 8  & 61.01 & 11.71 & 19.2 & 1.25$\times$ & 62\%  \\
+    strong & 4 & 4  & 54.26 & 14.00 & 25.8 & 1.40$\times$ & 35\%  \\
+    \midrule
+    weak   & 1 & 4 & 21.70 & 0.00  & 0.0  & 1.00$\times$ & 100\% \\
+    weak   & 2 & 4 & 38.83 & 11.30 & 29.1 & 0.56$\times$ & 56\%  \\
+    weak   & 4 & 4 & 53.49 & 13.91 & 26.0 & 0.41$\times$ & 41\%  \\
+    \bottomrule
+  \end{tabular}
+  \caption{Scaling sweep on a single Quadro RTX 6000 node. Strong scaling holds the global batch fixed; weak scaling holds the per-rank batch fixed. Efficiency is $T_1/(n\,T_n)$ for strong and $T_1/T_n$ for weak.}
+  \label{tab:scaling}
+\end{table}
+
+\paragraph{Bottleneck.} Communication time is $\sim$11--14\,ms across both sweeps regardless of \texttt{local\_B} or rank count. This suggests a latency-bound pattern: the $\sim$3.4\,M-param model ships $\sim$13.6\,MB of gradients in $\sim$50 separate D$\to$H + \texttt{MPI\_Allreduce} + H$\to$D round-trips, giving $\sim$280\,$\mu$s/parameter of fixed overhead. PCIe~Gen3's $\sim$16\,GB/s would clear 13.6\,MB in $\sim$0.85\,ms; the 14\,ms observed is a 16$\times$ latency tax, not a bandwidth issue. An Nsight Systems trace of \texttt{ranks=4} further attributes $\sim$30\,ms/step to synchronous \texttt{cudaMalloc}/\texttt{cudaFree} from per-step backward-path \texttt{Tensor} allocations, a host-side cost folded into the "compute" segment of Fig.~\ref{fig:scaling}. Together these explain why strong-scaling speedup tops out at $1.40\times$ and weak scaling drops to 41\% efficiency at fixed per-rank work.
+
+% ============================================================
+\section{Discussion of Approaches and Bottlenecks}
+% ============================================================
+
+Three changes would close most of the gap. \textbf{Fused Allreduce} collapses the $\sim$50 small per-parameter MPI calls into one bandwidth-bound reduction (expected: $\sim$12\,ms/step saved). \textbf{Pre-allocated backward scratch}: own the $\texttt{Tensor<float>}$ objects currently re-created inside \texttt{TransformerBlock::backward}, \texttt{MultiHeadAttention::backward}, and \texttt{launch\_attention\_backward} at construction time; Nsight identified this as $\sim$30\,ms/step of synchronous \texttt{cudaMalloc}/\texttt{cudaFree} (Sec.~\ref{sec:perf}), comparable to the Allreduce itself. \textbf{CUDA-aware MPI} would then eliminate the D$\to$H/H$\to$D staging entirely. Extrapolating, the unfused implementation should stop scaling around $n{=}8$ ranks on a single node.
+
+% ============================================================
+\section{Challenges and Next Steps}
+% ============================================================
+
+The main difficulties for this milestone were the LayerNorm backward that required careful derivation: $\gamma$ must appear \emph{inside} both reduction
+sums, not factored out as a scalar. The bug was caught by the CPU reference test. There was also some issues with initializing the weights.
+\paragraph{Next steps.}
+(1)~Fuse per-tensor all-reduce into one buffer call,
+(2)~compute/communication overlap via CUDA streams,
+(3)~training on WikiText-2,
+(4)~full GPT-2 benchmarks and final 6-page report,
+(5)~CUDA-aware MPI (maybe).
+
+\end{document}
