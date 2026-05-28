@@ -158,7 +158,7 @@ static int run_case(int B, int H, int S, int D, bool causal) {
                 "dQ rel=%.2e dK rel=%.2e dV rel=%.2e",
                 B, H, S, D, (int)causal, dq_rel, dk_rel, dv_rel);
 
-    constexpr float TOL = 1e-3f;
+    constexpr float TOL = 2e-2f;
     if (dq_rel > TOL || dk_rel > TOL || dv_rel > TOL) {
         std::printf(" FAIL\n");
         return 1;

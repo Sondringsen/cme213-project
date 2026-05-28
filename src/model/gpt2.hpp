@@ -74,6 +74,23 @@ struct GPT2 {
                 new TransformerBlock(config.C, config.n_heads,
                                      config.S, config.B, /*causal=*/true));
         }
+        init_weights();
+    }
+
+    // Xavier-initialize all linear weights with unique per-layer seeds.
+    // LayerNorm gamma/beta are already set to 1/0 in LayerNormLayer's
+    // constructor; embedding weights are set in EmbeddingLayer's constructor.
+    void init_weights(unsigned base = 42) {
+        unsigned s = base;
+        lm_head.init_xavier(s++);
+        for (auto* b : blocks) {
+            b->mha.W_q.init_xavier(s++);
+            b->mha.W_k.init_xavier(s++);
+            b->mha.W_v.init_xavier(s++);
+            b->mha.W_out.init_xavier(s++);
+            b->fc1.init_xavier(s++);
+            b->fc2.init_xavier(s++);
+        }
     }
 
     ~GPT2() {

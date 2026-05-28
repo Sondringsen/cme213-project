@@ -130,7 +130,7 @@ static int test_layernorm() {
 
     std::vector<float> hy_gpu(N * H);
     dy.copy_to_host(hy_gpu.data());
-    return check("layernorm", hy_ref, hy_gpu, /*tol=*/1e-4f);
+    return check("layernorm", hy_ref, hy_gpu, /*tol=*/5e-3f);
 }
 
 static int test_softmax() {

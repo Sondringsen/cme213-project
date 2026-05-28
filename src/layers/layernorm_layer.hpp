@@ -9,6 +9,7 @@
 
 #include "kernels/layernorm.cuh"
 #include "utils/tensor.hpp"
+#include <vector>
 
 struct LayerNormLayer {
     int     H;
@@ -33,6 +34,9 @@ struct LayerNormLayer {
           gamma({hidden}), beta({hidden}),
           d_gamma({hidden}), d_beta({hidden}),
           mean_buf({max_N}), rstd_buf({max_N}) {
+        std::vector<float> ones(hidden, 1.0f);
+        gamma.copy_from_host(ones.data());
+        beta.zero();
         d_gamma.zero();
         d_beta.zero();
     }

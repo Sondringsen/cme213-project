@@ -24,6 +24,9 @@
 
 #include "kernels/gemm.cuh"
 #include "utils/tensor.hpp"
+#include <cmath>
+#include <random>
+#include <vector>
 
 struct Linear {
     int in_features;
@@ -42,9 +45,15 @@ struct Linear {
         d_W.zero();
     }
 
-    // Initialize weights with Xavier uniform: values in [-sqrt(6/(in+out)), +sqrt(6/(in+out))]
-    // Call this after constructing on host, before training.
-    void init_xavier(unsigned seed = 0);
+    // Initialize weights
+    void init_xavier(unsigned seed = 0) {
+        float lim = std::sqrt(6.0f / static_cast<float>(in_features + out_features));
+        std::mt19937 gen(seed);
+        std::uniform_real_distribution<float> dist(-lim, lim);
+        std::vector<float> h_W(W.numel());
+        for (auto& v : h_W) v = dist(gen);
+        W.copy_from_host(h_W.data());
+    }
 
     // forward: out = x * W^T
     //   x   : device pointer to (N, in_features)

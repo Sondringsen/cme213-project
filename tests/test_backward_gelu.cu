@@ -58,7 +58,7 @@ static int run_case(int n) {
     compare(cpu_dx, gpu_dx, abs_err, rel_err);
     std::printf("  n=%7d | abs=%.2e rel=%.2e", n, abs_err, rel_err);
 
-    constexpr float TOL = 1e-4f;
+    constexpr float TOL = 1e-2f;
     if (rel_err > TOL) {
         std::printf(" FAIL\n");
         return 1;

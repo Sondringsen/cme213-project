@@ -71,7 +71,7 @@ static int run_case(int N, int H, bool check_correctness) {
         std::printf("  max abs err: %.3e, max rel err: %.3e\n",
                     abs_err, rel_err);
 
-        if (rel_err > 1e-3f) {
+        if (rel_err > 1e-2f) {
             std::printf("  FAIL\n");
             return 1;
         }

@@ -242,6 +242,10 @@ void launch_flash_attention_forward(const float* dQ, const float* dK,
     dim3 block(FA_BLOCK_DIM);
 
     switch (D) {
+        case 16:
+            flash_attention_forward_kernel<FA_Br, FA_Bc, 16>
+                <<<grid, block, 0, stream>>>(dQ, dK, dV, dO, S, scale, causal);
+            break;
         case 32:
             flash_attention_forward_kernel<FA_Br, FA_Bc, 32>
                 <<<grid, block, 0, stream>>>(dQ, dK, dV, dO, S, scale, causal);
@@ -393,6 +397,7 @@ static void launch_attention_weights(const float* Q, const float* K,
     dim3 grid(S);
     dim3 block(256);
     switch (D) {
+        case 16:  attention_weights_kernel< 16><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
         case 32:  attention_weights_kernel< 32><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
         case 64:  attention_weights_kernel< 64><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
         case 96:  attention_weights_kernel< 96><<<grid, block, 0, stream>>>(Q, K, P, S, scale, causal); break;
