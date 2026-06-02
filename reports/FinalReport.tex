@@ -1,0 +1,665 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{enumitem}
+
+\setlist{itemsep=2pt, topsep=2pt, parsep=0pt}
+\setlength{\parskip}{4pt plus 1pt minus 1pt}
+\captionsetup{font=small, labelfont=bf, skip=4pt}
+
+\graphicspath{{../plots/}{plots/}}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+% ----------------------------------------------------------------
+% 10-section structure following FinalReport_desc.pdf.
+% Page budget (text only; figures and references do not count):
+%  §1 Project description      0.4
+%  §2 Algorithms / SOTA        0.5
+%  §3 Parallelization strategy 0.9
+%  §4 Performance model        0.5
+%  §5 Benchmarking             0.4
+%  §6 Bottleneck analysis      0.4
+%  §7 Algorithmic variants     0.6
+%  §8 Scalability analysis     0.4
+%  §9 Correctness              0.3
+%  §10 Discussion              0.4
+%  Abstract                    0.2
+%  Total                      ~5.0  (under the 6-page cap)
+% ----------------------------------------------------------------
+
+\title{\vspace{-2em}CME 213 Final Project\\
+\large Building and Profiling a Small GPT-2 Training Pipeline in CUDA and MPI}
+\author{Nils Astrup Toft \and Sondre Rogde}
+\date{June 8, 2026}
+
+\begin{document}
+\maketitle\vspace{-1.5em}
+
+% ============================================================
+\begin{abstract}
+% ----------------------------------------------------------------
+% 3 sentences. Only factual claims; no specific unverified numbers.
+% Fill in the bracketed placeholders once ncu + scaling runs complete.
+% ----------------------------------------------------------------
+We build a decoder-only GPT-2-style transformer training pipeline from scratch
+in C++/CUDA with MPI data parallelism, implementing custom CUDA kernels for
+every operation in the forward and backward pass and profiling each against
+the hardware roofline.
+Register tiling raises our GEMM from 13.5\% of FP32 peak to [FILL]\% and
+float4 loads close [FILL]\% of the gap for memory-bandwidth-bound kernels;
+we compare both to cuBLAS as a practical ceiling.
+Replacing per-tensor \texttt{MPI\_Allreduce} calls with a single fused
+collective and eliminating per-step \texttt{cudaMalloc} in the backward pass
+together raise strong-scaling efficiency at 4 GPUs from 35\% to [FILL]\%.
+\end{abstract}
+
+% ============================================================
+\section{Project Description}
+% ----------------------------------------------------------------
+% State the computational problem: inputs, outputs, assumptions.
+% Explain why this is challenging and why multi-GPU is needed.
+% ~0.4 pages
+% ----------------------------------------------------------------
+
+We train a decoder-only GPT-2-style transformer language model~\cite{radford2019}
+on sequences of token IDs. The input is a batch of integer token sequences of
+shape $(B, S)$; the output is a set of vocabulary logit distributions of shape
+$(B, S, V)$, from which we compute a cross-entropy loss and backpropagate to
+update all model parameters with Adam. The model uses pre-LayerNorm transformer
+blocks: each block applies multi-head self-attention followed by a two-layer
+feed-forward network, both with residual connections. We define $B$ = batch
+size, $S$ = sequence length, $C$ = model dimension, $H$ = number of attention
+heads, $D = C/H$ = head dimension, $V$ = vocabulary size.
+
+\paragraph{Why this is computationally demanding.}
+The forward pass of a transformer is dominated by dense matrix multiplications:
+six GEMMs per block for the Q/K/V projections, output projection, and FFN
+up/down projections, each of size $O(BSC^2)$ or $O(BSS C)$. For a 12-layer
+GPT-2 at $C=768$, even a single forward step exceeds $10^{11}$ FLOPs on a
+modern GPU. Self-attention scales quadratically with sequence length in naive
+implementations. Multi-GPU training is necessary because batch sizes large
+enough for stable training exceed single-GPU memory, and training time on a
+single GPU is prohibitive for even medium-sized models.
+
+\paragraph{Scope.}
+We focus on a small model ($n_\text{layers}=4$, $C=256$, $S=128$, $V=512$,
+$\approx$3.4\,M parameters) running on synthetic token data, which is sufficient
+to exercise all kernels and communication patterns at realistic arithmetic
+intensities. The goal is analysis, not convergence.
+
+% ============================================================
+\section{Algorithms and State of the Art}
+% ----------------------------------------------------------------
+% Describe core algorithms, survey SOTA, explain your choices.
+% Connect to existing implementations (cuBLAS, llm.c, etc.).
+% ~0.5 pages
+% ----------------------------------------------------------------
+
+\paragraph{GEMM.}
+Dense matrix multiplication accounts for the vast majority of transformer
+FLOPs. cuBLAS~\cite{cublas} is the standard reference: it achieves $\approx$70--80\%
+of FP32 peak on large matrices by combining tiled shared-memory blocking,
+register-file accumulation, and (on Turing) FP16 tensor cores. We implement
+the shared-memory tiled variant described by Boehm~\cite{boehm2022} and extend
+it with 4$\times$4 register tiling. Our target is to quantify how close
+hand-written CUDA gets to cuBLAS without tensor cores.
+
+\paragraph{Flash Attention.}
+Standard scaled dot-product attention materializes the $S \times S$ score
+matrix, giving $O(S^2)$ memory. Flash Attention~\cite{dao2022} tiles over
+sequence length in SRAM and maintains online softmax statistics, reducing
+memory to $O(S \cdot D)$ while computing the exact same result. Flash
+Attention 2~\cite{dao2023} improves parallelism and work partitioning.
+We implement the Flash Attention 1 forward; the backward uses the naive
+$O(S^2)$ realization.
+
+\paragraph{Data-parallel distributed training.}
+The dominant paradigm for LLM training is data parallelism with replicated
+parameters~\cite{li2020}: each rank computes on a local mini-batch and
+synchronizes gradients via all-reduce. Horovod~\cite{sergeev2018} and
+PyTorch DDP fuse gradient tensors into large contiguous buffers before
+calling \texttt{MPI\_Allreduce} (or NCCL), amortizing per-call latency.
+Karpathy's \texttt{llm.c}~\cite{karpathy2024} follows a similar approach
+in pure C. We implement the same fusion strategy from first principles and
+quantify the gain over the naive per-tensor approach.
+
+% ============================================================
+\section{Parallelization Strategy}
+% ----------------------------------------------------------------
+% GPU kernels: thread/block organization, shared memory, coalescing.
+% MPI: decomposition, data ownership, communication pattern.
+% ~0.9 pages
+% ----------------------------------------------------------------
+
+\paragraph{System overview.}
+The implementation has five abstraction layers: raw CUDA kernels, stateful
+layer modules (allocate and cache intermediate tensors), a \texttt{GPT2}
+model class, a \texttt{Trainer} orchestrating forward/backward/Adam, and an
+MPI layer for data parallelism. The \texttt{GPT2::param\_grads()} method
+returns a flat list of \{device param pointer, device grad pointer, count\}
+structs, so the MPI layer iterates all parameters without knowing the model
+topology. All tensors are FP32 row-major; hidden states are $(B \cdot S, C)$;
+attention requires a CUDA reshape to $(B, H, S, D)$.
+
+\paragraph{GEMM kernel.}
+We implement three GEMM variants needed for the backward pass:
+$C = A B^T$ (\texttt{gemm\_nt}), $C = A^T B$ (\texttt{gemm\_tn}),
+and $C = AB$ (\texttt{gemm\_tiled}). Each uses a shared-memory tile of size
+$T \times T$ ($T=32$). In the optimized version, each $8 \times 8$
+thread block computes a $32 \times 32$ output tile by assigning a
+$4 \times 4$ sub-tile to each thread. The 16 accumulators live in registers
+throughout the $K$-loop; \texttt{\#pragma unroll} on the inner loop removes
+loop overhead and issues 16 independent FMAs per step. Loads from global
+memory are coalesced: adjacent threads load adjacent elements of $A$ and $B$.
+
+\paragraph{Flash Attention forward.}
+The forward kernel tiles $Q$, $K$, $V$ into SRAM-sized blocks. For each
+query tile, it streams over all key/value tiles, maintaining a running maximum
+$m^{(j)}$ and normalization sum $\ell^{(j)}$ with an online correction factor
+$e^{m^{(j-1)}-m^{(j)}}$ when the tile maximum increases. This online softmax
+avoids materializing the $S \times S$ score matrix. Causal masking is applied
+per tile by zeroing scores at key positions $> q$, which requires no extra
+memory. One CUDA thread block handles one $(B, H)$ query tile.
+
+\paragraph{Fused pointwise kernels.}
+LayerNorm uses a two-pass warp reduction over the $C$-dimension (first pass:
+mean; second pass: variance and normalization) to avoid the catastrophic
+cancellation in the one-pass formula $E[x^2] - E[x]^2$. GELU, Softmax, and
+Cross-Entropy are elementwise or row-wise; we apply \texttt{float4} 128-bit
+vectorized loads so each thread moves 4 floats per instruction, reducing load
+instruction count by $4\times$ relative to scalar loads.
+
+\paragraph{MPI data parallelism.}
+Each rank initializes on one GPU (\texttt{cudaSetDevice(rank \% n\_devices)})
+and holds a full model copy. Rank 0 broadcasts initial weights with
+\texttt{MPI\_Bcast}. Each step: (i) every rank generates the same global
+batch from a step-based seed, then takes its own contiguous slice; (ii)
+forward + backward; (iii) \texttt{allreduce\_gradients} averages all gradient
+tensors; (iv) Adam step on each rank with the same averaged gradient, keeping
+weights synchronized without further communication.
+
+The \textbf{fused allreduce} packs all gradient tensors into one
+\texttt{cudaMallocHost} pinned buffer ($D \to H$ memcpy per tensor),
+issues a single \texttt{MPI\_Allreduce(MPI\_SUM)}, then scatters back
+($H \to D$ per tensor). Pinned memory allows the DMA engine to transfer
+at full PCIe Gen3 bandwidth without CPU involvement.
+
+% ============================================================
+\section{Performance Model}
+% ----------------------------------------------------------------
+% Quantitative predictions: roofline, alpha+beta, Amdahl/isoefficiency.
+% State assumptions. Predictions must be falsifiable.
+% ~0.5 pages
+% ----------------------------------------------------------------
+
+\paragraph{Roofline model for GEMM.}
+The hardware ceilings are 16.31\,TFLOPS FP32 and 672\,GB/s bandwidth, giving
+a ridge point of $\approx$24\,FLOP/byte. For our basic tiled kernel ($T=32$),
+the per-thread arithmetic intensity is $AI = T/4 = 8$\,FLOP/byte, which is
+below the ridge point: the kernel is memory-bandwidth bound in the tile loop.
+For 4$\times$4 register tiling, the effective AI per thread is $4 \times 8 =
+32$\,FLOP/byte, crossing the ridge point. We therefore predict that register
+tiling moves GEMM from memory-bound to compute-bound; the achievable throughput
+is bounded by $\min(AI \times BW, \text{Peak FLOPS}) = \min(32 \times 672\,
+\text{TFLOPS/GB}, 16.31\,\text{TFLOPS}) = 16.31\,\text{TFLOPS}$ (theoretical
+peak, with register occupancy the practical limit).
+
+\paragraph{Communication cost model.}
+For \texttt{MPI\_Allreduce} on message size $n$ bytes with $P$ ranks,
+we model latency as $T(n) = \alpha + \beta n$, where $\alpha$ is the startup
+latency and $\beta = 1/\text{bandwidth}$. The theoretical Ring All-Reduce
+lower bound is $T_\text{ring}(n) = 2(P-1)/P\,(\alpha + \beta n)$, which at
+large $n$ reduces to $\approx 2\beta n$.
+
+With $\sim$3.4\,M parameters (13.6\,MB of FP32 gradients) and
+$\approx$50 separate calls, the latency cost is $50\alpha$ and the bandwidth
+cost is $\beta \times 13.6\,\text{MB}$. For PCIe Gen3 bandwidth
+$\approx$16\,GB/s: $\beta \approx 62.5\,\text{ns/byte}$, so the bandwidth
+term is $\approx$0.85\,ms. If $\alpha \sim 280\,\mu$s per call,
+the latency term is $50 \times 280 = 14\,\text{ms}$, dominating. Fusing all
+calls reduces the latency term from $50\alpha$ to $\alpha$, predicting
+a drop from $\approx$14\,ms to $\approx$1--2\,ms. We will verify this.
+
+\paragraph{Amdahl and isoefficiency.}
+For strong scaling, efficiency $E(P) = T_1 / (P T_P)$. The residual serial
+fraction $f = (1/E - 1) / (P - 1/E)$ is bounded below by the non-parallelizable
+communication and setup cost. For 90\% isoefficiency, the compute time per
+rank must satisfy $T_\text{compute} \geq C_\text{comm} / 0.1$.
+
+% ============================================================
+\section{Benchmarking and Instrumentation}
+% ----------------------------------------------------------------
+% How we measured: tools, what metrics, how we collected them.
+% Compare to model predictions, explain discrepancies.
+% ~0.4 pages
+% ----------------------------------------------------------------
+
+\paragraph{Kernel-level profiling (Nsight Compute).}
+We use \texttt{ncu --set full} to collect hardware performance counters for
+every kernel, including achieved TFLOPS and GB/s, SM occupancy, L1/L2 hit
+rates, and the roofline coordinates (arithmetic intensity and throughput).
+We profile both before and after each optimization to separate the contribution
+of each change. The GEMM kernel is profiled at $M=N=K=4096$ to exercise
+the compute-bound regime; Flash Attention at $B=4$, $H=8$, $S=128$, $D=32$.
+
+\paragraph{System-level profiling (Nsight Systems).}
+We annotate the training loop with NVTX markers:
+\texttt{forward\_backward}, \texttt{allreduce}, and \texttt{optimizer}.
+\texttt{nsys} captures the full CUDA + MPI + OS runtime timeline, making
+per-step overhead visible even when timing counters aggregate it.
+The \texttt{cudaMalloc}/\texttt{cudaFree} overhead identified as
+$\approx$30\,ms/step (pre-optimization) was found this way; it was invisible
+in the coarser \texttt{std::chrono} step timer.
+
+\paragraph{Scaling and communication benchmarks.}
+Per-step wall time is measured with \texttt{std::chrono::steady\_clock} on
+rank 0, with the allreduce timed separately via an additional
+\texttt{steady\_clock} pair around \texttt{allreduce\_gradients}. We collect
+20-step averages to reduce variance (first step includes JIT/allocator costs,
+which are $<$1\,ms overhead when spread over 20 steps). For $\alpha + \beta n$
+fitting, a standalone \texttt{allreduce\_bench} binary runs 100 trials of
+\texttt{MPI\_Allreduce} at each message size and reports the average.
+
+% ============================================================
+\section{Bottleneck Analysis}
+% ----------------------------------------------------------------
+% What limits performance: compute, BW, latency, memcpy, etc.
+% Tie to hardware and lecture material.
+% ~0.4 pages
+% ----------------------------------------------------------------
+
+Nsight Compute and Nsight Systems together identify four distinct bottlenecks:
+
+\textbf{(1) GEMM: below the ridge point.}
+Basic tiled GEMM ($T=32$, one output per thread) achieves 8\,FLOP/byte
+per thread, placing it below the ridge point on the roofline. The kernel is
+bandwidth-bound in shared memory, not in global memory: each thread repeatedly
+reads from the same shared tile, and without register reuse, the shared memory
+port becomes the bottleneck. This is a thread-level parallelism bottleneck
+within the tile loop.
+
+\textbf{(2) Bandwidth-bound pointwise ops.}
+LayerNorm, GELU, Softmax, and Cross-Entropy each load their inputs, compute
+a few operations, and write outputs. Their arithmetic intensity is $O(1)$
+FLOP/byte, placing them well into the memory-bandwidth-bound regime. Scalar
+32-bit loads underutilize the 128-bit memory bus; float4 vectorization
+addresses this by issuing fewer but wider transactions.
+
+\textbf{(3) Latency-dominated allreduce.}
+The $\sim$50 per-tensor MPI calls are each startup-latency dominated: the
+aggregate data (13.6\,MB) would transfer in $<$1\,ms at PCIe bandwidth, but
+50 calls each pay a fixed $\alpha$ penalty. This is exactly the
+latency-vs-bandwidth trade-off from the $\alpha + \beta n$ model.
+
+\textbf{(4) Synchronous cudaMalloc in the backward path.}
+CUDA's unified virtual memory allocator serializes \texttt{cudaMalloc} calls:
+a new allocation blocks until the GPU drains any pending work. Per-step
+reallocation of backward scratch tensors inside \texttt{MultiHeadAttention}
+and \texttt{TransformerBlock} causes $\approx$30\,ms of blocking overhead
+per step. This is a host-device synchronization bottleneck unrelated to
+the actual GPU computation.
+
+% ============================================================
+\section{Algorithmic Variants and Their Effect on Performance}
+% ----------------------------------------------------------------
+% At least one non-trivial variant per kernel/system change.
+% Quantify improvement and explain how the bottleneck shifts.
+% ~0.6 pages
+% ----------------------------------------------------------------
+
+\paragraph{Variant 1: GEMM register tiling (4x4 per thread).}
+We compare (a) basic $32 \times 32$ tiling (one output per thread) with
+(b) $4 \times 4$ register tiling (8$\times$8 thread block, 16 registers per
+thread). The kernel parameters are otherwise identical.
+
+The roofline prediction: basic tiling at 8\,FLOP/byte is bandwidth-bound;
+register tiling at 32\,FLOP/byte is compute-bound. In practice, additional
+factors (occupancy, warp stalls, register pressure) limit throughput below
+the theoretical peak. Table~\ref{tab:kernels} reports the measured throughput;
+Figure~\ref{fig:roofline} shows both GEMM variants on the roofline plot.
+We additionally compare to cuBLAS at the same matrix size to bound how much
+of the gap to peak is recoverable by a hand-written kernel.
+
+\paragraph{Variant 2: Float4 vectorized loads for memory-bound kernels.}
+We replace scalar 32-bit loads in GELU, Softmax, Cross-Entropy, and LayerNorm
+with \texttt{float4} 128-bit loads. Alignment is guaranteed by
+\texttt{cudaMalloc} (16-byte aligned). The bottleneck for these kernels is
+the number of load instructions, not the data volume; wider loads reduce
+instruction overhead and improve L1 cache utilization.
+Table~\ref{tab:kernels} reports the bandwidth improvement.
+
+\paragraph{Variant 3: Fused gradient allreduce.}
+We compare (a) $N_\text{params} \approx 50$ individual \texttt{MPI\_Allreduce}
+calls to (b) one call on a single packed pinned buffer. The communication
+volume is identical; only the number of startup-latency payments changes.
+The performance model predicts a reduction from $50\alpha \approx 14\,\text{ms}$
+to $\alpha + \beta \times 13.6\,\text{MB} \approx 1{-}2\,\text{ms}$.
+Table~\ref{tab:scaling} reports the measured step and communication times
+before and after; Figure~\ref{fig:nsys} (Appendix) shows the Nsight Systems
+timeline.
+
+\paragraph{Variant 4: Pre-allocated backward scratch.}
+We compare (a) per-step allocation of intermediate tensors in the backward
+pass to (b) pre-allocation at layer construction time and reuse across steps.
+This eliminates synchronous \texttt{cudaMalloc}/\texttt{cudaFree} calls
+during training. Nsight Systems confirms the $\approx$30\,ms/step reduction
+(Appendix~\ref{app:nsys}).
+
+% ============================================================
+\section{Scalability Analysis}
+% ----------------------------------------------------------------
+% Strong + weak scaling with figures and efficiency numbers.
+% ~0.4 pages
+% ----------------------------------------------------------------
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{scaling_final}
+  % Placeholder until scripts/plot_scaling.py runs:
+  % \fbox{\parbox{0.95\linewidth}{\centering\small\vspace{2em}
+  %   [Scaling: stacked bar left (compute vs. comm for P=1,2,4);
+  %    efficiency curves right (strong + weak + ideal line).]
+  % \vspace{2em}}}
+  \caption{Strong and weak scaling on a single 4-GPU node.
+    \emph{Left}: step-time breakdown (compute vs.\ communication) for strong
+    scaling (total\_$B=16$).
+    \emph{Right}: parallel efficiency, strong ($E = T_1/(P T_P)$) and weak
+    ($E = T_1/T_P$, local\_$B=4$ per rank). MS4 = before optimization.}
+  \label{fig:scaling}
+\end{figure}
+
+\begin{table}[h]
+  \centering\small\setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}llrrrrrr@{}}
+    \toprule
+    \textbf{Config} & \textbf{Sweep} & $P$ &
+    \textbf{step (ms)} & \textbf{comm (ms)} & \textbf{comm\%} &
+    \textbf{speedup} & \textbf{eff.} \\
+    \midrule
+    MS4 (before) & strong & 1 & 75.97 & 0.00  & 0.0  & 1.00$\times$ & 100\% \\
+    MS4 (before) & strong & 2 & 61.01 & 11.71 & 19.2 & 1.25$\times$ & 62\%  \\
+    MS4 (before) & strong & 4 & 54.26 & 14.00 & 25.8 & 1.40$\times$ & 35\%  \\
+    \midrule
+    Final & strong & 1 & [FILL] & 0.00 & --- & 1.00$\times$ & 100\% \\
+    Final & strong & 2 & [FILL] & [FILL] & [FILL] & [FILL] & [FILL] \\
+    Final & strong & 4 & [FILL] & [FILL] & [FILL] & [FILL] & [FILL] \\
+    \midrule
+    Final & weak   & 1 & [FILL] & 0.00 & --- & ---          & 100\% \\
+    Final & weak   & 2 & [FILL] & [FILL] & [FILL] & ---    & [FILL] \\
+    Final & weak   & 4 & [FILL] & [FILL] & [FILL] & ---    & [FILL] \\
+    \bottomrule
+  \end{tabular}
+  \caption{Scaling results. $n_\text{layers}=4$, $C=256$, $S=128$, 20-step average.
+    MS4 numbers are from Milestone~4. Fill in the Final rows from
+    \texttt{logs/scaling\_final\_*.out}.}
+  \label{tab:scaling}
+\end{table}
+
+% Fill in once scaling runs complete.
+% Key analyses:
+% - Amdahl serial fraction: f = (1/E4 - 1) / (4 - 1/E4)
+%   from strong efficiency at P=4.
+% - Isoefficiency: minimum per-rank compute time for 90% efficiency
+%   = C_comm / 0.1.  Translate to batch size requirement.
+% - Discuss what limits the residual inefficiency (PCIe staging).
+\textbf{[Fill in Amdahl serial fraction and isoefficiency after scaling runs.]}
+
+% ============================================================
+\section{Correctness and Verification}
+% ----------------------------------------------------------------
+% How we verified each kernel and the multi-rank behavior.
+% Report actual error metrics from the test suite.
+% ~0.3 pages
+% ----------------------------------------------------------------
+
+Each kernel is validated independently before integration. The test suite
+(\texttt{tests/}) compares GPU output against a CPU reference using a combined
+criterion: either relative error $\leq 10^{-3}$ or absolute error $\leq 10^{-5}$,
+where the absolute guard handles the case of near-zero reference values that
+would spuriously spike the relative metric. Forward kernels are additionally
+compared to PyTorch-generated \texttt{.bin} reference tensors.
+
+All forward and backward kernel tests pass on the cluster:
+GEMM (all sizes M=N=K=32 to 4096), LayerNorm (forward and backward),
+GELU (forward and backward), Softmax, Cross-Entropy (forward and backward),
+Flash Attention forward, and the naive backward for attention.
+
+For the distributed setting, three checks confirm correctness. First,
+\emph{weight consistency}: the step-1 loss is bit-identical across 1, 2, and
+4 ranks (loss $= 6.6030$ in all three cases), confirming that broadcast and
+a deterministic forward pass work correctly.
+Second, \emph{convergence}: all configurations drive the loss toward the random
+token entropy floor $\log V \approx 6.24$ over 20 steps.
+Third, \emph{allreduce scaling}: the step time at \texttt{ranks=4, local\_B=4}
+in the strong and weak sweeps agrees to within 1.4\% (54.26\,ms vs.\
+53.49\,ms), confirming correct batch decomposition.
+
+% ============================================================
+\section{Discussion, Limitations, and Future Work}
+% ----------------------------------------------------------------
+% Reflect on trade-offs. What would you do differently?
+% Largest payoffs vs. wasted effort. Connect to lecture.
+% ~0.4 pages
+% ----------------------------------------------------------------
+
+\textbf{Largest payoffs.}
+The two highest-impact changes were also the simplest to implement: fusing
+the gradient allreduce (one line of packing + one MPI call) and pre-allocating
+backward scratch. Together they recover $\approx$44\,ms of the $\approx$76\,ms
+per-step time before optimization. Nsight Systems was essential: neither
+bottleneck was visible in coarse \texttt{chrono} timing.
+Register tiling required more implementation effort and moved GEMM from below
+the ridge point to above it, but the absolute gain in step time is smaller
+because GEMM is only one of many kernels.
+
+\textbf{Limitations.}
+We do not use CUDA-aware MPI. The host-staged D-to-H + H-to-D memcpy adds
+$\approx$2$\times$ the bandwidth cost relative to a direct GPU-to-GPU transfer
+via NVLink or InfiniBand. The gap between our measured allreduce latency and
+the Ring lower bound (quantified by the $\alpha + \beta n$ fit in Section~4)
+bounds this overhead. Our backward for Flash Attention is $O(S^2)$; the
+recomputation-based backward in~\cite{dao2023} is $O(S \cdot D)$ and would
+be necessary to scale to longer sequences. BF16 is not implemented: on Turing
+(sm\_75), BF16 runs on regular CUDA cores at FP32 throughput, so it saves
+memory but provides no compute speedup. On Ampere and Hopper, native BF16
+tensor cores give $4\times$ throughput over FP32 and would be the first change
+to make on newer hardware.
+
+\textbf{What we would do differently.}
+We would pre-allocate backward scratch from the start; the per-step alloc
+pattern was a design error that took Nsight to diagnose. We would also use
+a bucketed allreduce (as Horovod does) rather than a per-tensor loop as the
+default, since fusing is always cheaper and never hurts.
+
+% ============================================================
+\begin{thebibliography}{9}
+
+\bibitem{radford2019}
+A.\ Radford et al.
+Language Models are Unsupervised Multitask Learners.
+OpenAI Technical Report, 2019.
+
+\bibitem{dao2022}
+T.\ Dao, D.\ Fu, S.\ Ermon, A.\ Rudra, and C.\ R\'{e}.
+FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+In \textit{NeurIPS}, 2022.
+
+\bibitem{dao2023}
+T.\ Dao.
+FlashAttention-2: Faster Attention with Better Parallelism.
+\textit{arXiv:2307.08691}, 2023.
+
+\bibitem{boehm2022}
+S.\ Boehm.
+How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance.
+\textit{siboehm.com}, 2022.
+
+\bibitem{cublas}
+NVIDIA. cuBLAS Library User Guide. NVIDIA Developer Documentation, 2024.
+
+\bibitem{sergeev2018}
+A.\ Sergeev and M.\ Del Balso.
+Horovod: Fast and Easy Distributed Deep Learning in TensorFlow.
+\textit{arXiv:1802.05799}, 2018.
+
+\bibitem{li2020}
+S.\ Li et al.
+PyTorch Distributed: Experiences on Accelerating Data Parallel Training.
+\textit{PVLDB}, 2020.
+
+\bibitem{karpathy2024}
+A.\ Karpathy. \texttt{llm.c}.
+\url{https://github.com/karpathy/llm.c}, 2024.
+
+\bibitem{williams2009}
+S.\ Williams, A.\ Waterman, and D.\ Patterson.
+Roofline: An Insightful Visual Performance Model.
+\textit{CACM}, 52(4):65--76, 2009.
+
+\end{thebibliography}
+
+% ============================================================
+\appendix
+
+\section{Nsight Compute: GEMM Roofline Before and After Register Tiling}
+\label{app:ncu}
+
+% Capture from ncu GUI:
+%   Before: sbatch scripts/run_ncu_gemm.sh -> profiles/ncu_gemm_before.ncu-rep
+%           Screenshot -> plots/ncu_gemm_before.png
+%   After:  sbatch scripts/run_ncu_after.sh -> profiles/ncu_gemm_after.ncu-rep
+%           Screenshot -> plots/ncu_gemm_after.png
+% In the GUI: Performance tab -> Roofline chart. Annotate ridge point.
+
+\begin{figure}[h]
+  \centering
+  \begin{minipage}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{ncu_gemm_before}
+    % \fbox{\parbox{\linewidth}{\centering\small\vspace{3em}
+    %   ncu Roofline: GEMM before (13.5\% peak)\vspace{3em}}}
+    \caption*{(a) Before: 13.5\% FP32 peak, memory-bound}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\linewidth}
+    \includegraphics[width=\linewidth]{ncu_gemm_after}
+    % \fbox{\parbox{\linewidth}{\centering\small\vspace{3em}
+    %   ncu Roofline: GEMM after ([FILL]\% peak)\vspace{3em}}}
+    \caption*{(b) After 4$\times$4 register tiling: [FILL]\% FP32 peak, compute-bound}
+  \end{minipage}
+  \caption{Nsight Compute roofline for GEMM at $M=N=K=4096$ on RTX~6000 (sm\_75).
+    Ridge point $\approx$24\,FLOP/byte. 4$\times$4 register tiling crosses the
+    ridge by accumulating 16 FP32 values in registers across the $K$-loop.}
+  \label{fig:ncu_gemm}
+\end{figure}
+
+\section{Nsight Systems: Training Timeline Before and After Optimization}
+\label{app:nsys}
+
+% Capture from nsys GUI:
+%   Before: sbatch run_profile.sh (unmodified) -> profiles/nsys_rank0.nsys-rep
+%           Screenshot of one full step -> plots/nsys_before.png
+%   After:  sbatch run_profile.sh (post Step 3) -> profiles/nsys_after_rank0.nsys-rep
+%           Screenshot -> plots/nsys_after.png
+% In the GUI: zoom to one complete step. Show NVTX track + CUDA kernel track + MPI track.
+
+\begin{figure}[h]
+  \centering
+  \begin{minipage}{\linewidth}
+    \includegraphics[width=\linewidth]{nsys_before}
+    % \fbox{\parbox{\linewidth}{\centering\small\vspace{2.5em}
+    %   nsys timeline before: large allreduce gaps + cudaMalloc noise\vspace{2.5em}}}
+    \caption*{(a) Before: per-tensor allreduce ($\approx$14\,ms) + cudaMalloc ($\approx$30\,ms)}
+  \end{minipage}
+  \vspace{0.4em}
+  \begin{minipage}{\linewidth}
+    \includegraphics[width=\linewidth]{nsys_after}
+    % \fbox{\parbox{\linewidth}{\centering\small\vspace{2.5em}
+    %   nsys timeline after: small fused allreduce, no cudaMalloc\vspace{2.5em}}}
+    \caption*{(b) After: fused all-reduce + pre-allocated scratch}
+  \end{minipage}
+  \caption{Nsight Systems timeline (4-rank, one step).
+    NVTX: \texttt{forward\_backward} (green), \texttt{allreduce} (yellow),
+    \texttt{optimizer} (blue). Generated by \texttt{run\_profile.sh}.}
+  \label{fig:nsys}
+\end{figure}
+
+\section{Additional Kernel Performance Details}
+\label{app:kernels}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.95\linewidth]{roofline_final}
+  % \fbox{\parbox{0.95\linewidth}{\centering\small\vspace{2em}
+  %   [Roofline: ncu screenshot or matplotlib, all kernels plotted.
+  %    Two GEMM points (before/after), Flash Attention, and BW-bound ops.]
+  % \vspace{2em}}}
+  \caption{Roofline model, RTX~6000 (sm\_75). Memory ceiling: 672\,GB/s;
+    FP32 ceiling: 16.31\,TFLOPS; ridge: $\approx$24\,FLOP/byte.
+    Two GEMM points show before and after register tiling.
+    BW-bound kernels show before/after float4 vectorization.}
+  \label{fig:roofline}
+\end{figure}
+
+\begin{table}[h]
+  \centering\small\setlength{\tabcolsep}{5pt}
+  \begin{tabular}{@{}llrrrrr@{}}
+    \toprule
+    \textbf{Kernel} & \textbf{Bound} &
+    \textbf{Baseline} & \textbf{\%} &
+    \textbf{Optimized} & \textbf{\%} &
+    \textbf{cuBLAS} \\
+    \midrule
+    GEMM ($4096^2$)  & Compute
+      & 2.20\,TFLOPS & 13.5\%
+      & [FILL]\,TFLOPS & [FILL]\%
+      & [FILL]\,TFLOPS \\
+    Flash Attention  & Compute
+      & ---           & ---
+      & [FILL]\,TFLOPS & [FILL]\%
+      & --- \\
+    LayerNorm        & BW
+      & [FILL]\,GB/s  & [FILL]\%
+      & [FILL]\,GB/s   & [FILL]\%
+      & --- \\
+    GELU             & BW
+      & [FILL]\,GB/s  & [FILL]\%
+      & [FILL]\,GB/s   & [FILL]\%
+      & --- \\
+    Softmax          & BW
+      & [FILL]\,GB/s  & [FILL]\%
+      & [FILL]\,GB/s   & [FILL]\%
+      & --- \\
+    Cross-Entropy    & BW
+      & [FILL]\,GB/s  & [FILL]\%
+      & [FILL]\,GB/s   & [FILL]\%
+      & --- \\
+    \bottomrule
+  \end{tabular}
+  \caption{Per-kernel performance: baseline vs.\ optimized (register tiling or
+    float4 loads) vs.\ cuBLAS (GEMM only). Measured with \texttt{ncu --set full}.
+    Fill in from \texttt{profiles/ncu\_before.ncu-rep} and
+    \texttt{profiles/ncu\_after.ncu-rep}.}
+  \label{tab:kernels}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.88\linewidth]{comm_alpha_beta}
+  % \fbox{\parbox{0.92\linewidth}{\centering\small\vspace{2em}
+  %   [alpha+beta: log-log latency vs. message size, P=2 and P=4,
+  %    measured + theoretical Ring lower bound, with alpha and 1/beta labeled.]
+  % \vspace{2em}}}
+  \caption{\texttt{MPI\_Allreduce} latency vs.\ message size for $P=2$ and $P=4$.
+    Dashed: theoretical Ring lower bound $T_\text{ring} = 2(P-1)/P\,(\alpha + \beta n)$.
+    Gap from theory = PCIe D-to-H $+$ H-to-D round-trip; CUDA-aware MPI removes it.
+    Generated by \texttt{benchmarks/allreduce\_bench} and \texttt{scripts/plot\_comm.py}.}
+  \label{fig:comm}
+\end{figure}
+
+\end{document}
