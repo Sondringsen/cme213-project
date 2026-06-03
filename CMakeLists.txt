@@ -81,6 +81,11 @@ endfunction()
 
 # Existing forward tests
 add_kernel_test(test_gemm)
+if(CUDAToolkit_FOUND AND TARGET CUDA::cublas)
+    target_link_libraries(test_gemm PRIVATE CUDA::cublas)
+    target_compile_definitions(test_gemm PRIVATE WITH_CUBLAS)
+    message(STATUS "cuBLAS found — cuBLAS comparison enabled in test_gemm")
+endif()
 add_kernel_test(test_layernorm)
 add_kernel_test(test_softmax)
 add_kernel_test(test_gelu)

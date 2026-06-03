@@ -24,6 +24,19 @@
 #include <cstdio>
 #include <vector>
 
+#ifdef WITH_CUBLAS
+#include <cublas_v2.h>
+#define CUBLAS_CHECK(call)                                                    \
+    do {                                                                      \
+        cublasStatus_t s = (call);                                            \
+        if (s != CUBLAS_STATUS_SUCCESS) {                                     \
+            std::fprintf(stderr, "cuBLAS error %d at %s:%d\n",               \
+                         (int)s, __FILE__, __LINE__);                         \
+            std::exit(1);                                                     \
+        }                                                                     \
+    } while (0)
+#endif
+
 // Run one (M, N, K) case. `check_correctness` runs the CPU oracle; turn it
 // off for large sizes where the CPU triple loop would take ages.
 // Returns 0 on success, 1 on correctness failure.
@@ -80,27 +93,110 @@ static int run_case(int M, int N, int K, bool check_correctness) {
     return 0;
 }
 
+#ifdef WITH_CUBLAS
+// Compare our kernel against cuBLAS for correctness (when check_correctness=true)
+// and report GFLOPS for both.
+//
+// cuBLAS uses column-major storage. For row-major C = A*B we use the identity
+// C^T = B^T * A^T, calling cublasSgemm with the pointers swapped and leading
+// dimensions set to the column counts of the original matrices.
+static int run_case_cublas(cublasHandle_t handle,
+                           int M, int N, int K,
+                           bool check_correctness) {
+    std::printf("--- cuBLAS M=%d N=%d K=%d ---\n", M, N, K);
+
+    std::vector<float> hA(static_cast<size_t>(M) * K);
+    std::vector<float> hB(static_cast<size_t>(K) * N);
+    fill_random(hA, 1);
+    fill_random(hB, 2);
+
+    Tensor<float> dA({M, K}), dB({K, N}), dC_ours({M, N}), dC_ref({M, N});
+    dA.copy_from_host(hA.data());
+    dB.copy_from_host(hB.data());
+
+    constexpr int N_ITER = 10;
+
+    auto launch_ours = [&]() {
+        launch_gemm_tiled(dA.data(), dB.data(), dC_ours.data(), M, N, K);
+    };
+    float ms_ours = time_kernel(launch_ours, N_ITER);
+
+    const float one = 1.0f, zero = 0.0f;
+    auto launch_cublas = [&]() {
+        CUBLAS_CHECK(cublasSgemm(handle,
+                                 CUBLAS_OP_N, CUBLAS_OP_N,
+                                 N, M, K,
+                                 &one,
+                                 dB.data(), N,
+                                 dA.data(), K,
+                                 &zero,
+                                 dC_ref.data(), N));
+    };
+    float ms_cublas = time_kernel(launch_cublas, N_ITER);
+
+    double gflops_ours   = (2.0 * M * N * K) / (ms_ours   * 1e-3) / 1e9;
+    double gflops_cublas = (2.0 * M * N * K) / (ms_cublas * 1e-3) / 1e9;
+    std::printf("  Ours:   %7.3f ms, %7.1f GFLOPS\n", ms_ours,   gflops_ours);
+    std::printf("  cuBLAS: %7.3f ms, %7.1f GFLOPS\n", ms_cublas, gflops_cublas);
+    std::printf("  Ratio ours/cuBLAS: %.1f%%\n", 100.0 * gflops_ours / gflops_cublas);
+    std::printf("PERF: kernel=gemm    M=%d N=%d K=%d ms=%.4f gflops=%.1f\n",
+                M, N, K, ms_ours, gflops_ours);
+    std::printf("PERF: kernel=cublas  M=%d N=%d K=%d ms=%.4f gflops=%.1f\n",
+                M, N, K, ms_cublas, gflops_cublas);
+
+    if (check_correctness) {
+        std::vector<float> hC_ours(static_cast<size_t>(M) * N);
+        std::vector<float> hC_ref(static_cast<size_t>(M) * N);
+        dC_ours.copy_to_host(hC_ours.data());
+        dC_ref.copy_to_host(hC_ref.data());
+
+        float abs_err, rel_err;
+        compare(hC_ref, hC_ours, abs_err, rel_err);
+        std::printf("  vs cuBLAS: max abs err=%.3e, max rel err=%.3e", abs_err, rel_err);
+
+        if (rel_err > 2e-3f) {
+            std::printf("  FAIL\n");
+            return 1;
+        }
+        std::printf("  PASS\n");
+    }
+    return 0;
+}
+#endif  // WITH_CUBLAS
+
 int main() {
     int fails = 0;
 
-    // Small sizes: correctness + timing. CPU reference is O(M*N*K) so we
-    // can't run it on huge matrices.
+    // Small sizes: correctness + timing vs CPU reference.
     fails += run_case(64,  64,  64,  /*check=*/true);
     fails += run_case(128, 128, 128, /*check=*/true);
-    // K=256 with 256×256 outputs contains many near-zero elements; max-rel
-    // blows up despite correct accumulation.  Check with a smaller K instead.
     fails += run_case(256, 256, 64,  /*check=*/true);
 
-    // Awkward, non-multiple-of-TILE shapes -- exercises the boundary-mask
-    // logic in the kernel.
+    // Non-multiples of tile dimensions — exercises boundary masking.
     fails += run_case(127, 65, 99, /*check=*/true);
     fails += run_case(33,  33, 33, /*check=*/true);
 
-    // Larger sizes: timing only. These reflect realistic GPT-2 GEMM shapes.
-    // E.g. the FFN-up projection at d_model=768 is (batch*seq) x 768 -> 3072.
+    // Larger sizes: timing only (CPU oracle is too slow).
     run_case(1024, 1024, 1024, /*check=*/false);
     run_case(2048, 2048, 2048, /*check=*/false);
     run_case(4096, 4096, 4096, /*check=*/false);
+
+#ifdef WITH_CUBLAS
+    std::printf("\n=== cuBLAS comparison ===\n");
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // Small: correctness vs cuBLAS + timing.
+    fails += run_case_cublas(handle, 128,  128,  128,  /*check=*/true);
+    fails += run_case_cublas(handle, 256,  256,  256,  /*check=*/true);
+
+    // GPT-2 realistic shapes: timing + ratio only.
+    run_case_cublas(handle, 1024, 1024, 1024, /*check=*/false);
+    run_case_cublas(handle, 2048, 2048, 2048, /*check=*/false);
+    run_case_cublas(handle, 4096, 4096, 4096, /*check=*/false);
+
+    CUBLAS_CHECK(cublasDestroy(handle));
+#endif
 
     if (fails) {
         std::printf("\n%d case(s) FAILED\n", fails);
