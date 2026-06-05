@@ -130,14 +130,20 @@ echo "=============================================="
 # range so that initialization kernels (fill, memset, etc.) and the optimizer
 # are excluded. This gives a clean view of only the training compute kernels.
 # Removing --launch-count so we capture the full forward+backward in one step.
-mpirun -np 1 ncu \
+# Give ncu a job-private temp dir so it can create its lock file without
+# hitting /tmp permission issues on the shared cluster nodes.
+NCU_TMPDIR="$HOME/.ncu_tmp_${SLURM_JOB_ID}"
+mkdir -p "$NCU_TMPDIR"
+
+TMPDIR="$NCU_TMPDIR" mpirun -np 1 ncu \
     -o profiles/ncu_kernels \
     --set full \
     --force-overwrite \
-    --nvtx \
-    --nvtx-include "forward_backward" \
+    --launch-count 500 \
     ./build/train_distributed \
         $NCU_STEPS $NCU_LAYERS $NCU_C $NCU_S $NCU_TOTAL_B
+
+rm -rf "$NCU_TMPDIR"
 
 echo
 echo "Nsight Compute file:"
