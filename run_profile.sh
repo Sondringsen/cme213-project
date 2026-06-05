@@ -48,7 +48,8 @@ echo
 # Build
 # ---------------------------------------------------------------------------
 echo "--- Building (sm_75 + NVTX) ---"
-make CUDA_ARCH=75
+cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 if [ $? -ne 0 ]; then
     echo "Build FAILED -- aborting."
     exit 1
@@ -68,10 +69,10 @@ NSYS_S=128
 NSYS_TOTAL_B=8    # 2 sequences per rank with 4 ranks
 
 NCU_STEPS=1       # just 1 step — ncu profiles every kernel launch
-NCU_LAYERS=2
-NCU_C=128
-NCU_S=32
-NCU_TOTAL_B=4
+NCU_LAYERS=4
+NCU_C=256
+NCU_S=128
+NCU_TOTAL_B=8
 
 # ===========================================================================
 # Nsight Systems — 4-rank CUDA + MPI + NVTX timeline
@@ -125,11 +126,16 @@ echo " Nsight Compute: single-rank kernel metrics"
 echo " Steps=$NCU_STEPS  Layers=$NCU_LAYERS  C=$NCU_C  S=$NCU_S"
 echo "=============================================="
 
+# --nvtx / --nvtx-include: scope profiling to the "forward_backward" NVTX
+# range so that initialization kernels (fill, memset, etc.) and the optimizer
+# are excluded. This gives a clean view of only the training compute kernels.
+# Removing --launch-count so we capture the full forward+backward in one step.
 mpirun -np 1 ncu \
-    --output=profiles/ncu_kernels \
+    -o profiles/ncu_kernels \
     --set full \
     --force-overwrite \
-    --launch-count 200 \
+    --nvtx \
+    --nvtx-include "forward_backward" \
     ./build/train_distributed \
         $NCU_STEPS $NCU_LAYERS $NCU_C $NCU_S $NCU_TOTAL_B
 
@@ -141,13 +147,5 @@ echo
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-echo "=============================================="
-echo " Download commands (run from your local machine):"
-echo "   scp ${USER}@<cluster>:$(pwd)/profiles/*.nsys-rep ."
-echo "   scp ${USER}@<cluster>:$(pwd)/profiles/*.ncu-rep  ."
-echo
-echo " Open in GUI:"
-echo "   nsys_rank*.nsys-rep  ->  Nsight Systems"
-echo "   ncu_kernels.ncu-rep  ->  Nsight Compute"
 echo "=============================================="
 echo "Finished at: $(date)"
