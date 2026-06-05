@@ -1,173 +1,104 @@
 # Step 1 — Baseline Nsight Profiling
 
-**Goal:** Capture "before" profiling data before any optimizations. These screenshots and numbers go into the report as the baseline.
+**Goal:** Capture "before" profiling data before any optimizations. Run `run_profile.sh` unchanged — it already produces both the ncu roofline file and the nsys timeline in one job.
 
-**Estimated time:** 2 hours (mostly cluster queue wait)
-
----
-
-## What We Are Profiling
-
-1. **Nsight Compute (ncu)** — per-kernel hardware counters:
-   - Achieved TFLOPS and GB/s for every kernel
-   - SM occupancy
-   - Roofline position (compute-bound vs memory-bound)
-   - Register usage, shared memory utilization
-
-2. **Nsight Systems (nsys)** — end-to-end CUDA + MPI timeline:
-   - NVTX regions: `step_N`, `forward_backward`, `allreduce`, `optimizer`
-   - cudaMalloc / cudaFree calls (the 30 ms/step overhead)
-   - cudaMemcpy D→H and H→D for staging allreduce
-   - MPI_Allreduce gaps between CUDA work
+**Estimated time:** 30 min work + cluster queue wait
 
 ---
 
-## Steps
+## What the Script Does
 
-### 1. Build (on cluster)
+`run_profile.sh` already handles everything:
 
-```bash
-make CUDA_ARCH=75
-```
+| Output | Tool | Config |
+|--------|------|--------|
+| `profiles/ncu_kernels.ncu-rep` | Nsight Compute | 1 rank, 2 layers, C=128, S=32, 1 step, --launch-count 200 |
+| `profiles/nsys_rank{0-3}.nsys-rep` | Nsight Systems | 4 ranks, 4 layers, C=256, S=128, 5 steps |
 
-Verify the binary exists: `ls -lh build/train_distributed`
-
-### 2. Run Nsight Compute baseline
-
-The existing `run_profile.sh` already does this. Submit it as-is for the baseline:
+Submit as-is:
 
 ```bash
 sbatch run_profile.sh
 ```
 
-This produces `profiles/ncu_kernels.ncu-rep` (single rank, 2 layers, C=128, S=32, 1 step).
-
-**Important:** The `--launch-count 200` flag limits ncu to the first 200 kernel launches so the job doesn't time out. With 2 layers and 1 step, all major kernels appear at least once.
-
-For a deeper GEMM-only profile (needed for before/after comparison), also run:
+Run it **before** any float4 changes. After float4 optimization (Step 2), rename the outputs and run again:
 
 ```bash
-sbatch scripts/run_ncu_gemm.sh
+# After Step 2 float4 changes, before running run_profile.sh again:
+mv profiles/ncu_kernels.ncu-rep profiles/ncu_kernels_before.ncu-rep
+mv profiles/nsys_rank0.nsys-rep profiles/nsys_before_rank0.nsys-rep
+# ... then sbatch run_profile.sh  →  produces ncu_kernels.ncu-rep as "after"
 ```
 
-(Create this script — see below.)
-
-### 3. Run Nsight Systems baseline
-
-Also produced by `run_profile.sh`:
-- `profiles/nsys_rank0.nsys-rep` through `profiles/nsys_rank3.nsys-rep`
-
-Open `nsys_rank0.nsys-rep` in Nsight Systems on your local machine. The NVTX timeline should show:
-- Green `forward_backward` regions
-- Yellow `allreduce` regions (these are the ~14 ms/step gaps)
-- Small `optimizer` regions
-
-**Screenshot to capture for the report:**
-- One full step showing all three NVTX phases + the MPI gaps
-- Zoom into the allreduce region to show the D→H + MPI + H→D pattern
-
-### 4. Download profiles to local machine
+Download to local machine:
 
 ```bash
-# Run from your local machine:
-scp <cluster>:<project_dir>/profiles/ncu_kernels.ncu-rep ./profiles/
-scp <cluster>:<project_dir>/profiles/nsys_rank0.nsys-rep ./profiles/
+scp <cluster>:<project_dir>/profiles/*.ncu-rep  ./profiles/
+scp <cluster>:<project_dir>/profiles/*.nsys-rep ./profiles/
 ```
 
 ---
 
-## New Script to Create: `scripts/run_ncu_gemm.sh`
+## What to Look for in Nsight Compute
 
-This is a focused ncu run targeting only the GEMM kernel at a large matrix size (4096×4096) for maximum precision on the roofline:
+Open `ncu_kernels.ncu-rep` in the Nsight Compute GUI. Go to **Roofline Analysis**.
 
-```bash
-#!/bin/bash
-#SBATCH --job-name=ncu_gemm
-#SBATCH --output=logs/ncu_gemm_%j.out
-#SBATCH --partition=gpu-turing
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:20:00
+### LayerNorm — primary analysis target
 
-cd "$SLURM_SUBMIT_DIR"
-mkdir -p profiles logs
+This is the kernel to examine most carefully.
 
-make CUDA_ARCH=75
+- **Memory throughput**: LayerNorm reads x, gamma, beta twice (two-pass: mean then variance), so theoretical minimum bandwidth is `2 × 3 × H × 4 bytes` per row. Check how close the kernel gets to the 672 GB/s ceiling.
+- **Occupancy**: the block size is 256 threads, one block per row. Check whether shared memory for the reduction (256 floats = 1 KB) limits occupancy.
+- **Warp efficiency**: the tree reduction at the end of each pass leaves half the warps idle. Look for this in the Warp State Statistics view.
+- **Two-pass vs one-pass**: the code uses two passes for numerical stability (catastrophic cancellation in the one-pass `var = E[x²] - E[x]²` when inputs are large). This costs one extra read of x per row — visible as higher-than-expected bytes/row ratio.
 
-# Profile only the GEMM test binary, full metrics
-ncu \
-    --output=profiles/ncu_gemm_before \
-    --set full \
-    --kernel-name-base function \
-    --kernel-name gemm_tiled_kernel \
-    --force-overwrite \
-    ./build/test_gemm
+### Adam — bandwidth reference
 
-echo "Done. File: profiles/ncu_gemm_before.ncu-rep"
-```
+Should sit on the bandwidth ceiling. Reads 2 arrays (param, grad) and writes 3 (param, m, v) → 5 × 4 bytes per element. Check achieved GB/s vs `5 × 4 × n_params × freq`.
 
-**Note:** The kernel name `gemm_tiled_kernel` must match the actual `__global__` function name in `src/kernels/gemm.cu`. Check with:
-```bash
-strings build/test_gemm | grep "kernel"
-```
+### GELU, Softmax, Cross-Entropy
+
+These should all cluster near the bandwidth ceiling. If any are significantly below it, float4 loads will help. Note their positions as a group.
+
+### GEMM, Flash Attention — brief notes only
+
+Both were covered in homework; no deep analysis needed. Just note their roofline positions (GEMM: near compute ridge; Flash Attention: somewhere between compute and bandwidth bounds depending on sequence length) for the one-sentence report mentions.
 
 ---
 
-## What to Look for in ncu
+## What to Look for in Nsight Systems
 
-Open `ncu_kernels.ncu-rep` or `ncu_gemm_before.ncu-rep` in Nsight Compute on your local machine.
+Open `nsys_before_rank0.nsys-rep` in Nsight Systems.
 
-### For GEMM
-- **Roofline chart**: should show GEMM near the compute-bound ridge line, but below it. Note the exact FLOP/byte (arithmetic intensity) and achieved GFLOPS/s.
-- **SM occupancy**: typically low (<50%) without register tiling because the thread block is large
-- **L2 cache hit rate**: should be reasonable for tiled GEMM
-- **Warp efficiency**: look for predicated-off lanes
+**Screenshots to capture for the report (Appendix B):**
 
-### For Flash Attention
-- **Memory throughput**: should be much lower than peak (attention is compute-heavy but uses SRAM tricks)
-- **Compute throughput**: should be higher than naive attention
+1. **One full training step** — shows the three NVTX phases: `forward_backward` (green), `allreduce` (yellow), `optimizer` (small). The allreduce gap should be visually large (~14 ms vs ~75 ms total).
 
-### For LayerNorm / GELU / Softmax / Cross-Entropy
-- **Memory throughput**: these should be close to the 672 GB/s bandwidth ceiling
-- **Compute throughput**: very low (barely any FLOPS per byte loaded)
-- **If significantly below bandwidth ceiling**: float4 vectorized loads will help
+2. **Zoom into the allreduce region** — shows the D→H memcpy, ~50 MPI_Allreduce calls, then H→D memcpy. This is the "before fused allreduce" picture.
+
+3. **Zoom into the forward_backward region** — look for `cudaMalloc`/`cudaFree` spikes (the ~30 ms overhead). They appear as orange/red marks in the CUDA API row.
 
 ---
 
-## What to Capture for the Report
+## Hardware Reference (Quadro RTX 6000, sm_75)
 
-| Item | From | Report section |
-|------|------|---------------|
-| ncu roofline chart (all kernels) | ncu GUI | §4, Figure 1 |
-| GEMM: achieved GFLOPS, % of peak | ncu metrics | §4, Table 2 |
-| Flash Attention: achieved GFLOPS, GB/s | ncu metrics | §4, Table 2 |
-| LayerNorm achieved bandwidth, % of peak | ncu metrics | §4, Table 2 |
-| nsys timeline screenshot (one full step) | nsys GUI | Appendix B |
-| nsys zoom into allreduce gap | nsys GUI | Appendix B |
+| Property | Value |
+|----------|-------|
+| FP32 peak | 16.31 TFLOPS |
+| Memory bandwidth | 672 GB/s |
+| Ridge point | ~24.3 FLOP/byte |
+| L2 cache | 4 MB |
+| Shared mem / SM | 64 KB |
+| Max threads / SM | 2048 |
+| Tensor cores | FP16 only |
 
 ---
 
-## Context for Interpreting Results
+## Checklist
 
-- **Quadro RTX 6000 (Turing sm_75):**
-  - FP32 peak: 16.31 TFLOPS
-  - Memory bandwidth: 672 GB/s
-  - Ridge point: ~24.3 FLOP/byte
-  - L2 cache: 4 MB
-  - Shared memory per SM: 64 KB (configurable)
-  - Max registers per SM: 65536
-  - Max threads per SM: 2048
-  - Tensor cores: FP16 only (not BF16)
-
-- **Arithmetic intensity for GEMM** at tile size T=32:
-  - Each thread loads 2T floats and does 2T² operations per (T×T) output tile
-  - AI = 2T² / (2T × 4 bytes) = T/4 = 8 FLOP/byte for T=32
-  - This is **below the ridge point** (~24 FLOP/byte), meaning without register tiling, GEMM is memory-bound even though it should be compute-bound at this matrix size
-  - With 4×4 register tiling, AI improves to 4× higher → 32 FLOP/byte, crossing the ridge point
-
-- **Arithmetic intensity for Flash Attention** (forward):
-  - Loads Q, K, V tiles; computes QK^T + softmax + V; writes O
-  - Avoids materializing full S×S matrix
-  - AI ≈ O(S·D) / O(S·D) = O(1) per sequence step but proportional to block size
-  - Practically: Flash Attention should be higher AI than memory-bound threshold
+- [ ] `sbatch run_profile.sh` — wait for completion
+- [ ] Rename outputs to `*_before.*` before running again after optimizations
+- [ ] Download `.ncu-rep` and `.nsys-rep` to local machine
+- [ ] Open ncu GUI — screenshot LayerNorm roofline position, note GB/s
+- [ ] Open nsys GUI — screenshot full step timeline and allreduce zoom
+- [ ] Note Adam, GELU, Softmax, Cross-Entropy GB/s from ncu for Table 2 in report

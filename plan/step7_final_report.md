@@ -53,25 +53,30 @@ Figures (roofline, scaling, comm), the kernel table, and references are extra pa
 - Keep short. This is the framing paragraph, not the main content.
 
 ### §2 Algorithms and SOTA
-- GEMM: basic shared-memory tiling vs. cuBLAS. We implement register tiling; cuBLAS uses tensor cores + software pipelining. Our goal is to quantify how close register tiling alone gets.
-- Flash Attention: reference Dao et al. 2022. Mention FA-2 (better parallelism) as something we didn't implement.
+- GEMM: one sentence — register-tiled kernel achieves X% of cuBLAS. No analysis; this was covered in hw4. cuBLAS uses tensor cores + software pipelining as the practical ceiling.
+- Flash Attention: reference Dao et al. 2022. Note that the forward kernel was implemented in hw7; this project adds the naïve O(S²) backward and integrates both into the training loop. Mention FA-2 (better parallelism across heads) as an extension not implemented.
+- Softmax: online one-pass reduction (also a hw7 building block) — one sentence.
 - Data parallelism: Horovod and PyTorch DDP use bucketed/fused allreduce. We implement the same from scratch to understand and quantify the gain.
 - llm.c (Karpathy) as a related from-scratch reference implementation.
 
 ### §3 Parallelization Strategy
 Most important section technically. Cover:
 1. Five-layer abstraction (brief — Table 1 in the main text handles this)
-2. GEMM: tile layout, register tiling, coalesced global loads, __pragma unroll
-3. Flash Attention: SRAM tiling, online softmax, causal masking per tile
-4. LayerNorm: two-pass warp reduction (explain WHY two-pass — catastrophic cancellation in one-pass formula)
-5. Float4: what it does and alignment requirement
-6. MPI: one GPU per rank, scatter_batch (host-side slice), broadcast_weights (once), allreduce_gradients (fused, pinned buffer), Adam (identical on all ranks)
-7. Why we DON'T use CUDA-aware MPI (not enabled on cluster) and how that affects the gap from Ring bound
+2. GEMM: one sentence on tile layout + register tiling. No deep analysis.
+3. Flash Attention: one sentence on SRAM tiling and memory saving. No deep analysis — done in hw7.
+4. LayerNorm: this is the kernel to explain in depth.
+   - Why two-pass: the one-pass formula `var = E[x²] - E[x]²` catastrophically cancels when inputs are large relative to variance. We encountered this as NaN/incorrect variance during development. Two-pass computes mean first, then `E[(x-mean)²]` — numerically stable but reads x twice.
+   - Bandwidth floor: 16H bytes/row forward (x read twice, gamma+beta once, y once). State this as the roofline prediction.
+   - Backward: three separate per-row reductions needed (sum of dy, sum of dy×xhat, then dx). Each requires a shared-memory tree reduction, leaving half the warps idle at each step. Explain the occupancy trade-off.
+   - Float4: reduces the normalization pass from 3×H scalar loads to 3×H/4 float4 loads.
+5. MPI: one GPU per rank, scatter_batch (host-side slice), broadcast_weights (once), allreduce_gradients (fused, pinned buffer), Adam (identical on all ranks)
+6. Why we DON'T use CUDA-aware MPI (not enabled on cluster) and how that affects the gap from Ring bound
 
 ### §4 Performance Model
 Must be quantitative with falsifiable predictions:
-- GEMM: compute AI = T/4 = 8 FLOP/byte (below ridge at 24); predict memory-bound. With 4x4 tiling: 32 FLOP/byte; predict compute-bound. State the theoretical peak after crossing ridge.
-- Communication: α+βn model. At 50 calls: 50*alpha dominates. After fusing: alpha + beta*13.6 MB ~ 1-2 ms. These are predictions; Section 7 verifies them.
+- LayerNorm: bandwidth AI = 2 FLOP / (16 bytes) = 0.125 FLOP/byte — well below the ridge at 24. Predict bandwidth-bound. Theoretical peak GB/s = achieved FLOP/s ÷ AI. With float4: same AI, but fewer instructions → predict bandwidth utilization increases. State the expected GB/s ceiling = 672 GB/s.
+- GEMM: one number — AI = (2MNK) / (4(MK+KN+MN)) FLOP/byte. For square matrices: AI = K/2 FLOP/byte. At K=128: 64 FLOP/byte, above ridge → predict compute-bound. Measured GFLOPS/peak gives efficiency.
+- Communication: α+βn model. At 50 calls: 50α dominates. After fusing: α + β × 13.6 MB ~ 1-2 ms. These are predictions; Section 7 verifies them.
 - Amdahl: E(P) = T1/(P*T_P). Predict residual serial fraction = PCIe staging.
 - Isoefficiency: derive minimum batch size for 90% efficiency from measured C_comm.
 
@@ -87,21 +92,20 @@ Compare measurements to model predictions at end of this section.
 
 ### §6 Bottleneck Analysis
 Four bottlenecks, each tied to hardware:
-1. GEMM below ridge point → shared memory bandwidth (not global) is the bottleneck within the tile loop
-2. BW-bound pointwise ops → 32-bit loads underutilize 128-bit memory bus
-3. 50-call allreduce → latency term 50*alpha >> bandwidth term beta*13.6 MB
-4. Per-step cudaMalloc → host-device synchronization drains GPU pipeline
+1. LayerNorm below bandwidth ceiling → 32-bit scalar loads leave 75% of the 128-bit memory bus unused; two-pass reads x twice, doubling the already-high bandwidth demand
+2. BW-bound kernel group (GELU, Softmax, CE, Adam) → same 32-bit load issue; scalar loads issue 4× more memory transactions than float4
+3. 50-call allreduce → latency term 50α >> bandwidth term β × 13.6 MB
+4. Per-step cudaMalloc → host-device synchronization stalls the GPU pipeline for ~30 ms/step (found by nsys, invisible to step-time chrono)
 
-Connect each to lecture: GPU memory hierarchy (1, 2), alpha+beta model (3), CPU-GPU synchronization (4).
+Connect each to lecture: GPU memory hierarchy and load width (1, 2), α+β model (3), CPU-GPU synchronization (4).
 
 ### §7 Algorithmic Variants
-For each of the four variants:
-- State what changed (one sentence)
-- Predict the effect (from the model in §4)
-- Report the measured result (from ncu or run_distributed.sh)
-- Explain how the bottleneck shifts
+For each variant: state what changed (one sentence), predict the effect (from §4 model), report the measured result, explain how the bottleneck shifts.
 
-The four variants: GEMM register tiling, float4 loads, fused allreduce, pre-allocated scratch.
+1. **float4 loads (LayerNorm)**: replaces 3H scalar loads per row with 3H/4 float4 loads in the normalization pass. Prediction: reduces instruction count 4×; if instruction overhead was the bottleneck, GB/s increases toward ceiling. Report: X GB/s → Y GB/s.
+2. **float4 loads (GELU)**: same pattern on a pure elementwise kernel — cleaner case, easier to reason about. Report: X GB/s → Y GB/s.
+3. **Fused allreduce**: single flat buffer replaces 50 per-tensor calls. Prediction: 50α → α; bandwidth term unchanged. Report: X ms/step → Y ms/step at 4 GPUs.
+4. **Pre-allocated backward scratch**: eliminates per-step cudaMalloc/Free. Prediction: removes 30 ms/step overhead seen in nsys. Report: step time before/after.
 
 ### §8 Scalability Analysis
 - Report Table (scaling_final.tex data) with MS4 before and final after
@@ -126,14 +130,13 @@ Three key takeaways (already in skeleton):
 
 ## On the Homework Overlap
 
-The report should explicitly acknowledge that tiled GEMM (HW4) and Flash Attention forward (HW6) were covered in homework. The key differentiators to emphasize:
-- **Register tiling** is also implemented in the homework
-- **Full backward passes** for all operations (homework is forward-only)
-- **End-to-end integration** into a training pipeline (no homework does this)
-- **Quantitative before/after analysis** using Nsight (no homework does this)
-- **cuBLAS comparison** as a performance ceiling
+Acknowledge the overlap briefly in §2. The differentiators to emphasize throughout the report:
+- **Full backward passes** for all operations — homework was forward-only
+- **LayerNorm** as the novel kernel to analyze — not covered in any homework; encountered real numerical issues (one-pass instability) during development that are worth discussing
+- **End-to-end integration** into a training pipeline — correctness is validated against bit-identical loss across ranks, not just per-kernel tests
+- **Quantitative before/after analysis** using Nsight across all kernels — no homework does this at this scope
 
-Suggested framing in §2: "This work builds on the tiled GEMM and Flash Attention kernels from the homework, extending them with register tiling (§7), complete backward passes, and end-to-end integration. We benchmark against cuBLAS as a practical performance ceiling."
+Suggested framing in §2: "This work builds on the tiled GEMM and Flash Attention kernels from the course homework; those kernels are briefly characterized in §4 but not analyzed in depth. The novel contributions are the LayerNorm forward/backward implementation (§3), the fused MPI allreduce (§7), and the end-to-end quantitative performance analysis (§5–§8)."
 
 ---
 
@@ -153,13 +156,13 @@ Suggested framing in §2: "This work builds on the tiled GEMM and Flash Attentio
 
 | Figure | Script/Source | Location |
 |--------|---------------|---------|
-| Roofline (all kernels) | ncu GUI or matplotlib from ncu CSV | `plots/roofline_final.png` |
+| Roofline (all kernels) | ncu GUI — Roofline Analysis view | `plots/roofline_all_kernels.png` |
+| LayerNorm roofline before float4 | ncu GUI screenshot | `plots/ncu_layernorm_before.png` |
+| LayerNorm roofline after float4 | ncu GUI screenshot | `plots/ncu_layernorm_after.png` |
 | Scaling (stacked bar + efficiency) | `scripts/plot_scaling.py` | `plots/scaling_final.png` |
 | α+βn comm | `scripts/plot_comm.py` | `plots/comm_alpha_beta.png` |
-| ncu GEMM before | ncu GUI screenshot | `plots/ncu_gemm_before.png` |
-| ncu GEMM after | ncu GUI screenshot | `plots/ncu_gemm_after.png` |
-| nsys before | nsys GUI screenshot | `plots/nsys_before.png` |
-| nsys after | nsys GUI screenshot | `plots/nsys_after.png` |
+| nsys before (full step + allreduce zoom) | nsys GUI screenshot | `plots/nsys_before.png` |
+| nsys after (full step + allreduce zoom) | nsys GUI screenshot | `plots/nsys_after.png` |
 
 Make all plots with clean fonts, axis labels, and legends. No default matplotlib styling.
 

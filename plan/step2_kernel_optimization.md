@@ -1,236 +1,141 @@
-# Step 2 — Kernel Optimization
+# Step 2 — Kernel Profiling and Optimization
 
-**Goal:** Improve GEMM utilization from ~13.5% to ≥50% of FP32 peak via register tiling, and improve bandwidth-bound kernels via float4 vectorized loads. Capture before/after ncu screenshots for the report.
+**Goal:** Profile all training kernels on the roofline, implement float4 vectorized loads for bandwidth-bound kernels (centered on LayerNorm), and capture before/after ncu data for the report.
 
-**Estimated time:** 3 hours
-
----
-
-## Optimization 1: GEMM Register Tiling
-
-### What and Why
-
-The current tiled GEMM (`src/kernels/gemm.cu`) uses a 32×32 thread block where each thread computes exactly 1 output element. This means:
-- Per thread: loads 32 A values + 32 B values from shared memory → 64 loads → computes 32 FMAs (64 FLOP)
-- Arithmetic intensity: 64 FLOP / (64 × 4 bytes) = 0.25 FLOP/byte per thread (very low in registers)
-- Most time is spent on shared memory reads, not compute
-
-With **4×4 register tiling**, each thread computes a 4×4 output sub-tile:
-- Per thread: loads 4 A values + 4 B values per K-step → 8 loads → computes 32 FMAs (64 FLOP)
-- Arithmetic intensity per thread: 64 FLOP / (8 × 4 bytes) = 2 FLOP/byte (8× better than 1×1)
-- Register file holds the 4×4 accumulators across the K-loop → reuse without shared memory traffic
-
-### Implementation Plan
-
-File: `src/kernels/gemm.cu`
-
-**Thread block configuration:**
-- Instead of 32×32 threads computing 32×32 output: use 8×8 threads computing 32×32 output (each thread handles 4×4)
-- Thread block size: BM=BN=32 (output tile), BK=8 (K-dimension per step)
-- Threads per block: 8×8 = 64
-- Each thread: TM=4, TN=4 output registers
-
-**Pseudocode for new kernel:**
-```cuda
-__global__ void gemm_reg_tiled(const float* A, const float* B, float* C,
-                                 int M, int N, int K) {
-    // BM=32, BN=32, BK=8, TM=4, TN=4
-    // One thread block computes a 32×32 output tile
-    // Thread (ty, tx) where ty,tx in [0,8) computes a 4×4 sub-tile
-
-    __shared__ float smA[BM][BK];   // 32×8 = 256 floats = 1 KB
-    __shared__ float smB[BK][BN];   // 8×32 = 256 floats = 1 KB
-
-    float regA[TM] = {0};  // 4 values from A
-    float regB[TN] = {0};  // 4 values from B
-    float regC[TM][TN] = {0};  // 4×4 accumulators (16 registers)
-
-    int row = blockIdx.y * BM + ty * TM;
-    int col = blockIdx.x * BN + tx * TN;
-
-    for (int k = 0; k < K; k += BK) {
-        // Collaborative load: all 64 threads load a 32×8 tile of A and 8×32 of B
-        // (requires careful indexing so all threads participate in loading)
-        
-        __syncthreads();
-        
-        // Each thread loads TM values of A and TN values of B from shared mem
-        for (int kk = 0; kk < BK; kk++) {
-            for (int m = 0; m < TM; m++) regA[m] = smA[ty*TM+m][kk];
-            for (int n = 0; n < TN; n++) regB[n] = smB[kk][tx*TN+n];
-            for (int m = 0; m < TM; m++)
-                for (int n = 0; n < TN; n++)
-                    regC[m][n] += regA[m] * regB[n];
-        }
-        
-        __syncthreads();
-    }
-    
-    // Write 4×4 output tile to C
-    for (int m = 0; m < TM; m++)
-        for (int n = 0; n < TN; n++)
-            if (row+m < M && col+n < N)
-                C[(row+m)*N + (col+n)] = regC[m][n];
-}
-```
-
-**Key implementation details:**
-1. The 64-thread block must cooperatively load the 32×8 and 8×32 shared memory tiles. With 64 threads and 256 elements to load per tile, each thread loads 4 elements.
-2. Loading pattern: thread `(ty, tx)` loads `smA[ty*4+i][tx/2]` for i in [0,4) (approximate — need exact bounds checking).
-3. Use `#pragma unroll` on the TM and TN inner loops to let the compiler fully unroll the 4×4 accumulation into 16 independent FMAs.
-4. Consider double-buffering: prefetch the next K-chunk into a second shared memory buffer while computing with the current one (requires `__pipeline_commit()` on sm_80+, but on sm_75 use manual double-buffering with `cp.async` not available — use two smA/smB pairs and alternate).
-
-**Correctness check:**
-Run `./build/test_gemm` after modification. All existing tests must still pass (M=N=K=32, 128, 256, 512, 1024, 4096).
-
-**Performance check after optimization:**
-```bash
-# Run ncu on the updated binary
-ncu --output=profiles/ncu_gemm_after --set full \
-    --kernel-name gemm_reg_tiled_kernel \
-    --force-overwrite \
-    ./build/test_gemm
-```
-
-Expected: ≥50% of 16.31 TFLOPS = ≥8.15 TFLOPS at M=N=K=4096.
-
-### Also: Transpose variants
-
-The GEMM backward uses `launch_gemm_tn` (A^T×B) and `launch_gemm_nt` (A×B^T). These can also benefit from register tiling, but apply to the forward GEMM first since it's the hottest path. The transposed variants can use similar 4×4 tiling.
+**Estimated time:** 2 hours
 
 ---
 
-## Optimization 2: float4 Vectorized Loads (Bandwidth-Bound Kernels)
+## Kernel Analysis Plan
 
-### What and Why
+### GEMM — one sentence in the report
 
-LayerNorm, GELU, Softmax, and Cross-Entropy are all memory-bandwidth bound. Each thread currently loads one `float` at a time (32-bit loads). Replacing with `float4` loads (128-bit) reduces:
-- Number of load instructions by 4×
-- Instruction overhead (fewer memory transactions issued)
-- L1 cache pressure (wider loads have better cache efficiency)
+Already register-tiled (BM=128, BN=128, BK=8, TM=8, TN=8). Run `./build/test_gemm` for the GFLOPS vs cuBLAS ratio. That number goes in §2 ("our register-tiled kernel achieves X% of cuBLAS") and nothing more — this is homework material.
 
-This is especially effective on Turing where the L1/shared memory path is wide.
+### Flash Attention — one paragraph in the report
 
-### Implementation Pattern
+Also covered in hw7. Worth one paragraph noting where it sits on the roofline and the memory-saving tradeoff (no S×S materialization). The forward vs backward contrast (O(S·D) vs O(S²) memory traffic) is visible in the ncu data and worth one sentence.
 
-For any elementwise kernel that processes N floats:
+### Softmax — one sentence
+
+Part of the hw7 Flash Attention building blocks. Just report the achieved bandwidth as part of the bandwidth-bound kernel group.
+
+### LayerNorm — the analysis centerpiece
+
+This is the kernel to examine in depth. It was not covered in any homework and has real design choices worth explaining.
+
+**Why it is interesting:**
+
+1. **Two-pass vs one-pass numerical stability.** The one-pass formula `var = E[x²] - E[x]²` suffers catastrophic cancellation when input values are large relative to the variance (common after embedding lookup without pre-normalization). We hit this during development — the kernel produced NaN or wildly incorrect variance for certain input ranges. The fix is the two-pass approach: first reduce to compute the mean, then reduce again for `var = E[(x - mean)²]`. This costs one extra global read of x per row, which is directly visible in the bandwidth measurement.
+
+2. **Bandwidth floor from two-pass.** With H hidden units per row, the forward reads x twice (mean pass + variance pass), plus gamma and beta once, and writes y once. Theoretical minimum: `(3H + H) × 4 = 16H bytes` per row. Comparing the achieved GB/s against this theoretical floor tells you whether the kernel is fully bandwidth-bound or has overhead.
+
+3. **Backward is more complex.** The backward needs three independent per-row reductions: `sum(dy)`, `sum(dy × xhat)`, and `dx` itself. Each requires a shared memory tree reduction, which leaves half the warps idle for log2(blockDim) steps. The occupancy cost of 256 threads × 3 reduction arrays in shared memory is worth noting.
+
+4. **float4 improvement.** The normalization pass (read x, gamma, beta → write y) is a clean float4 target. Before/after GB/s gives a concrete number for §7.
+
+**From ncu, answer these questions:**
+- Achieved GB/s vs the 16H bytes/row theoretical floor — how close?
+- Occupancy — how many warps active vs max? Is shared memory or register count the limiter?
+- Warp State Statistics — what fraction of cycles are stalled on memory?
+- After float4: does the achieved GB/s increase, or were we already memory-latency bound?
+
+---
+
+## Optimization: float4 Vectorized Loads
+
+### LayerNorm (`src/kernels/layernorm.cu`)
+
+In the normalization pass, load x, gamma, and beta as `float4` (4 floats per instruction instead of 1). The two reduction passes (which accumulate into a scalar) stay unchanged.
 
 ```cuda
-// Before: each thread loads 1 float
-__global__ void kernel(float* x, float* out, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) out[i] = some_op(x[i]);
+// Normalization pass — replace scalar loads with float4
+for (int i = tid * 4; i + 3 < H; i += LN_BLOCK * 4) {
+    float4 xi    = reinterpret_cast<const float4*>(row_x)[i / 4];
+    float4 gi    = reinterpret_cast<const float4*>(gamma)[i / 4];
+    float4 bi    = reinterpret_cast<const float4*>(beta)[i / 4];
+    // apply normalization to xi.x, xi.y, xi.z, xi.w ...
+    float4 yi; /* ... */
+    reinterpret_cast<float4*>(row_y)[i / 4] = yi;
 }
-
-// After: each thread loads 4 floats
-__global__ void kernel_vec4(float* x, float* out, int N) {
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (i + 3 < N) {
-        float4 val = reinterpret_cast<float4*>(x)[i/4];
-        float4 res;
-        res.x = some_op(val.x);
-        res.y = some_op(val.y);
-        res.z = some_op(val.z);
-        res.w = some_op(val.w);
-        reinterpret_cast<float4*>(out)[i/4] = res;
-    }
-    // Handle tail: if N % 4 != 0, process remaining elements scalar
-}
+// scalar tail for H % 4 != 0
 ```
 
-**Requirement:** The input pointer must be 16-byte aligned (guaranteed by cudaMalloc) and N must be a multiple of 4 (enforce in the layer with padding if needed, or handle the tail).
+Requirement: H must be a multiple of 4 (true for all realistic hidden sizes).
 
-### Kernels to Vectorize
+### GELU (`src/kernels/gelu.cu`) — simplest
 
-1. **`src/kernels/gelu.cu`** — `launch_gelu_forward` and `launch_gelu_backward`:
-   - Each element: `x → x * 0.5 * (1 + erf(x/sqrt(2)))`
-   - Pure elementwise → trivial to vectorize
-   
-2. **`src/kernels/layernorm.cu`** — `launch_layernorm_forward`:
-   - The main loop over hidden dimension reads x, gamma, beta
-   - Can load x and gamma as float4 in the reduction passes
-   - More complex due to two-pass reduction; vectorize the data load
-   
-3. **`src/kernels/softmax.cu`** — `launch_softmax_forward`:
-   - Each block handles one row; the reduction is over C elements
-   - Load x as float4 in the max-finding and sum passes
-   
-4. **`src/kernels/cross_entropy.cu`** — `launch_cross_entropy_forward`:
-   - Reads logits row; loads as float4 for the softmax reduction
+Pure elementwise. Each thread processes 4 elements instead of 1.
 
-### Correctness Check
+```cuda
+int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+if (i + 3 < N) {
+    float4 x4 = reinterpret_cast<const float4*>(x)[i / 4];
+    float4 y4 = {gelu(x4.x), gelu(x4.y), gelu(x4.z), gelu(x4.w)};
+    reinterpret_cast<float4*>(out)[i / 4] = y4;
+}
+// scalar tail
+```
 
-Run `./build/test_gelu`, `./build/test_layernorm`, `./build/test_softmax`, `./build/test_cross_entropy` after each change.
+Same pattern for GELU backward.
+
+### Softmax and Cross-Entropy — if time allows
+
+Both process one row per block. Float4 the data load in the max/sum pass. Lower priority — the GELU and LayerNorm numbers are enough for §7.
+
+**After each change:** run the corresponding test binary to verify correctness.
 
 ---
 
-## Profiling After Optimizations
+## Profiling
 
-### Script: `scripts/run_ncu_after.sh`
+Use the existing `run_profile.sh` (do not create a new script). Run it once before float4 changes, rename outputs to `*_before.*`, then run again after.
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=ncu_after
-#SBATCH --output=logs/ncu_after_%j.out
-#SBATCH --partition=gpu-turing
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:20:00
+# Baseline (before float4)
+sbatch run_profile.sh
+mv profiles/ncu_kernels.ncu-rep  profiles/ncu_kernels_before.ncu-rep
+mv profiles/nsys_rank0.nsys-rep  profiles/nsys_before_rank0.nsys-rep
 
-cd "$SLURM_SUBMIT_DIR"
-mkdir -p profiles logs
-make CUDA_ARCH=75
-
-# Full training step profile (all kernels, post-optimization)
-mpirun -np 1 ncu \
-    --output=profiles/ncu_after_full \
-    --set full \
-    --force-overwrite \
-    --launch-count 300 \
-    ./build/train_distributed 1 2 128 32 4
-
-echo "Done. profiles/ncu_after_full.ncu-rep"
+# After float4 changes
+sbatch run_profile.sh
+# outputs go to profiles/ncu_kernels.ncu-rep (the "after" file)
 ```
-
-### Expected Results
-
-| Kernel | Before (% peak) | After (% peak) |
-|--------|----------------|----------------|
-| GEMM (4096×4096) | 13.5% FP32 | ≥50% FP32 |
-| Flash Attention | ~40% compute | ~50% compute |
-| GELU | ~60% BW | ~80% BW |
-| LayerNorm | ~55% BW | ~75% BW |
-| Softmax | ~50% BW | ~70% BW |
-| Cross-Entropy | ~45% BW | ~65% BW |
-
-(Exact numbers will come from ncu; these are estimates for planning.)
 
 ---
 
 ## Report Content from This Step
 
-### Section 4 (CUDA Kernels) content
-- Before/after GEMM roofline positions
-- Explain register tiling: "each thread now accumulates a 4×4 output tile in registers, reducing shared memory traffic by 4× and achieving X% of peak"
-- Explain float4: "replacing scalar loads with 128-bit vectorized loads reduces instruction count 4× and improves bandwidth utilization from X% to Y%"
-- Table: per-kernel achieved GFLOPS/GB/s before and after
+### §2 Algorithms (brief mentions)
+- GEMM: "register-tiled kernel achieves X% of cuBLAS; see HW4 for tiling analysis."
+- Flash Attention: "extends the hw7 forward kernel with a naïve O(S²) backward; forward avoids materializing the S×S attention matrix."
+- Softmax: "uses online one-pass max-then-sum reduction from hw7."
 
-### Appendix A content
-- Screenshot 1: ncu roofline view, GEMM before (dot far below compute ceiling)
-- Screenshot 2: ncu roofline view, GEMM after (dot near compute ceiling)
-- Screenshot 3: ncu Warp State Statistics showing improved issue efficiency
+### §3 Parallelization (LayerNorm section)
+- Explain two-pass design and why one-pass is numerically unstable
+- State the bandwidth floor: 16H bytes/row forward, ~20H bytes/row backward
+- Mention float4 and alignment requirement
+
+### §6 Bottleneck Analysis
+- LayerNorm: bandwidth-bound, X% of 672 GB/s peak; two-pass doubles read traffic vs one-pass
+
+### §7 Algorithmic Variants
+- float4 for LayerNorm: X GB/s → Y GB/s (Z% improvement)
+- float4 for GELU: same pattern, different numbers
+
+### Appendix A
+- Roofline screenshot: LayerNorm before and after float4 (two dots, one moves toward bandwidth ceiling)
+- Roofline screenshot: GELU, Softmax, CE, Adam as a group (all near bandwidth ceiling)
 
 ---
 
-## Summary Checklist
+## Checklist
 
-- [ ] Implement 4×4 register tiling in `gemm_tiled_kernel` in `src/kernels/gemm.cu`
-- [ ] Verify all `test_gemm` tests pass
-- [ ] Run `ncu` before and after, save to `profiles/ncu_gemm_before.ncu-rep` and `profiles/ncu_gemm_after.ncu-rep`
-- [ ] Record GFLOPS numbers for the report table
-- [ ] Add float4 loads to `gelu.cu`, `layernorm.cu`, `softmax.cu`, `cross_entropy.cu`
-- [ ] Verify all corresponding tests pass
-- [ ] Run `ncu_after_full.sh` for the complete training step profile
-- [ ] Screenshot the roofline charts from ncu GUI
-- [ ] Save screenshots to `plots/` for the report
+- [ ] Run `./build/test_gemm` — record GFLOPS vs cuBLAS ratio for §2 sentence
+- [ ] Run baseline `sbatch run_profile.sh` — rename to `*_before.*`
+- [ ] Add float4 to `gelu.cu` (forward + backward); verify `test_gelu` passes
+- [ ] Add float4 to `layernorm.cu` normalization pass; verify `test_layernorm` passes
+- [ ] Add float4 to `softmax.cu` if time allows; verify `test_softmax` passes
+- [ ] Run post-optimization `sbatch run_profile.sh`
+- [ ] Screenshot LayerNorm roofline before/after from ncu GUI → `plots/ncu_layernorm_before.png`, `plots/ncu_layernorm_after.png`
+- [ ] Record per-kernel GB/s for the report table (LayerNorm, GELU, Softmax, CE, Adam)
