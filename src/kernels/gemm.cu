@@ -208,104 +208,210 @@ void launch_gemm_tiled(const float* dA, const float* dB, float* dC,
 }
 
 // ===========================================================================
-// Transpose-aware GEMM kernels for backward passes.
+// Register-tiled transpose-aware GEMM kernels for backward passes.
 //
-// These use a simpler TILE=32 tiled kernel (not register-tiled) because:
-//   1. They are used in backward passes where throughput is less critical.
-//   2. Transposed access patterns are harder to optimize with register tiling.
+// Same BM/BN/BK/TM/TN block structure as the NN kernel. The only differences
+// are how the transposed operand is loaded into shared memory:
 //
-// launch_gemm_tn: C = A^T * B
-//   A is stored as (K, M), i.e. A^T is (M, K).
-//   B is (K, N), C is (M, N).
+//   gemm_tn (C = A^T * B, A stored K×M):
+//     A is loaded as A[k][m] → Asub[m][k]  (vary m across warp → stride-1 reads)
+//     Asub declared [BM][BK+1] for bank-conflict-free writes (stride 9, coprime to 32)
+//     Accumulation identical to NN kernel.
 //
-// launch_gemm_nt: C = A * B^T
-//   A is (M, K), B is stored as (N, K), i.e. B^T is (K, N).
-//   C is (M, N).
+//   gemm_nt (C = A * B^T, B stored N×K):
+//     B is loaded as B[n][k] → Bsub[n][k]  (vary k across warp → stride-1 reads)
+//     Bsub declared [BN][BK+1] with +1 padding.
+//     Accumulation reads b_reg[tn] = Bsub[tx*TN+tn][k] instead of Bsub[k][tx*TN+tn].
 // ===========================================================================
 
-constexpr int TILE = 32;
-
 // ---- C = A^T * B, A stored as K×M ----
-__global__ void gemm_tn_kernel(const float* __restrict__ A,  // K×M
-                               const float* __restrict__ B,  // K×N
-                               float* __restrict__ C,         // M×N
-                               int M, int N, int K) {
-    __shared__ float Asub[TILE][TILE];
-    __shared__ float Bsub[TILE][TILE];
+__global__ void gemm_tn_reg_kernel(const float* __restrict__ A,  // K×M
+                                   const float* __restrict__ B,  // K×N
+                                   float* __restrict__ C,        // M×N
+                                   int M, int N, int K) {
+    // Asub[BM][BK+1]: stores A^T tile — element [m_local][k_local].
+    // +1 padding: row stride 9 is coprime to 32 → all smem writes hit distinct banks.
+    __shared__ float Asub[BM][BK + 1];
+    __shared__ float Bsub[BK][BN];
 
-    // Output: C[row, col]
-    int row = blockIdx.y * TILE + threadIdx.y;  // M dimension
-    int col = blockIdx.x * TILE + threadIdx.x;  // N dimension
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * (BN / TN) + tx;
 
-    float acc = 0.0f;
-    int num_k_tiles = (K + TILE - 1) / TILE;
+    int row_base = blockIdx.y * BM;
+    int col_base = blockIdx.x * BN;
+
+    float acc[TM][TN] = {};
+
+    // A load: vary m within warp (tid % BM) → stride-1 reads from K×M storage.
+    // K_STRIDE = NUM_THREADS / BM = 2; each thread covers 4 (k, m) pairs.
+    int a_inner_m = tid % BM;
+    int a_inner_k = tid / BM;
+    constexpr int A_K_STRIDE = NUM_THREADS / BM;
+
+    // B load: same as NN kernel (B is K×N, coalesced along N).
+    // K_STRIDE = NUM_THREADS / BN = 2.
+    int b_inner_col = tid % BN;
+    int b_inner_row = tid / BN;
+    constexpr int B_K_STRIDE = NUM_THREADS / BN;
+
+    int num_k_tiles = (K + BK - 1) / BK;
 
     for (int t = 0; t < num_k_tiles; ++t) {
-        // A^T[row, t*TILE + tx] = A[(t*TILE + tx), row] = A[(t*TILE+tx)*M + row]
-        int k_A = t * TILE + threadIdx.x;
-        Asub[threadIdx.y][threadIdx.x] =
-            (row < M && k_A < K) ? A[k_A * M + row] : 0.0f;
+        int k_offset = t * BK;
 
-        // B[t*TILE + ty, col] = B[(t*TILE+ty)*N + col]
-        int k_B = t * TILE + threadIdx.y;
-        Bsub[threadIdx.y][threadIdx.x] =
-            (k_B < K && col < N) ? B[k_B * N + col] : 0.0f;
+        // Load A[k][m] → Asub[m][k]: adjacent tids vary m → stride-1 global reads.
+        #pragma unroll
+        for (int i = 0; i < A_LOADS; ++i) {
+            int k_local  = a_inner_k + i * A_K_STRIDE;
+            int global_k = k_offset + k_local;
+            int global_m = row_base + a_inner_m;
+            Asub[a_inner_m][k_local] =
+                (global_m < M && global_k < K) ? A[global_k * M + global_m] : 0.0f;
+        }
+
+        // Load B[k][n] → Bsub[k][n]: same as NN kernel, coalesced along N.
+        #pragma unroll
+        for (int i = 0; i < B_LOADS; ++i) {
+            int k_local  = b_inner_row + i * B_K_STRIDE;
+            int global_k = k_offset + k_local;
+            int global_n = col_base + b_inner_col;
+            Bsub[k_local][b_inner_col] =
+                (global_k < K && global_n < N) ? B[global_k * N + global_n] : 0.0f;
+        }
 
         __syncthreads();
+
+        // Accumulation identical to NN kernel: Asub and Bsub layouts are the same.
         #pragma unroll
-        for (int k = 0; k < TILE; ++k) acc += Asub[threadIdx.y][k] * Bsub[k][threadIdx.x];
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) a_reg[tm] = Asub[ty * TM + tm][k];
+
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) b_reg[tn] = Bsub[k][tx * TN + tn];
+
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn)
+                    acc[tm][tn] += a_reg[tm] * b_reg[tn];
+        }
+
         __syncthreads();
     }
 
-    if (row < M && col < N) C[row * N + col] = acc;
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        int r = row_base + ty * TM + tm;
+        if (r >= M) break;
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            int c = col_base + tx * TN + tn;
+            if (c < N) C[r * N + c] = acc[tm][tn];
+        }
+    }
 }
 
 // ---- C = A * B^T, B stored as N×K ----
-__global__ void gemm_nt_kernel(const float* __restrict__ A,  // M×K
-                               const float* __restrict__ B,  // N×K
-                               float* __restrict__ C,         // M×N
-                               int M, int N, int K) {
-    __shared__ float Asub[TILE][TILE];
-    __shared__ float Bsub[TILE][TILE];
+__global__ void gemm_nt_reg_kernel(const float* __restrict__ A,  // M×K
+                                   const float* __restrict__ B,  // N×K
+                                   float* __restrict__ C,        // M×N
+                                   int M, int N, int K) {
+    __shared__ float Asub[BM][BK];
+    // Bsub[BN][BK+1]: stores B tile — element [n_local][k_local].
+    __shared__ float Bsub[BN][BK + 1];
 
-    int row = blockIdx.y * TILE + threadIdx.y;
-    int col = blockIdx.x * TILE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * (BN / TN) + tx;
 
-    float acc = 0.0f;
-    int num_k_tiles = (K + TILE - 1) / TILE;
+    int row_base = blockIdx.y * BM;
+    int col_base = blockIdx.x * BN;
+
+    float acc[TM][TN] = {};
+
+    // A and B share the same fast/slow index split (both keyed on BK).
+    // inner_k: K position (stride-1 in A's K dim and B's K dim).
+    // inner_slow: M position for A load, N position for B load.
+    int inner_k    = tid % BK;
+    int inner_slow = tid / BK;
+    constexpr int B_N_STRIDE = NUM_THREADS / BK;
+
+    int num_k_tiles = (K + BK - 1) / BK;
 
     for (int t = 0; t < num_k_tiles; ++t) {
-        // A[row, t*TILE + tx] = A[row*K + t*TILE + tx]
-        int k_A = t * TILE + threadIdx.x;
-        Asub[threadIdx.y][threadIdx.x] =
-            (row < M && k_A < K) ? A[row * K + k_A] : 0.0f;
+        int k_offset = t * BK;
 
-        // B^T[t*TILE + ty, col] = B[col, t*TILE+ty] = B[col*K + t*TILE+ty]
-        int k_B = t * TILE + threadIdx.y;
-        Bsub[threadIdx.y][threadIdx.x] =
-            (col < N && k_B < K) ? B[col * K + k_B] : 0.0f;
+        // Load A[m][k] → Asub[m][k]: same as NN kernel, coalesced along K.
+        #pragma unroll
+        for (int i = 0; i < A_LOADS; ++i) {
+            int r        = inner_slow + i * (NUM_THREADS / BK);
+            int global_r = row_base + r;
+            int global_c = k_offset + inner_k;
+            Asub[r][inner_k] =
+                (global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f;
+        }
+
+        // Load B[n][k] → Bsub[n][k]: adjacent tids vary k → stride-1 global reads.
+        #pragma unroll
+        for (int i = 0; i < B_LOADS; ++i) {
+            int n        = inner_slow + i * B_N_STRIDE;
+            int global_n = col_base + n;
+            int global_k = k_offset + inner_k;
+            Bsub[n][inner_k] =
+                (global_n < N && global_k < K) ? B[global_n * K + global_k] : 0.0f;
+        }
 
         __syncthreads();
+
+        // Accumulation: read b_reg from Bsub[n_local][k] (N-major layout).
         #pragma unroll
-        for (int k = 0; k < TILE; ++k) acc += Asub[threadIdx.y][k] * Bsub[k][threadIdx.x];
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) a_reg[tm] = Asub[ty * TM + tm][k];
+
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) b_reg[tn] = Bsub[tx * TN + tn][k];
+
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn)
+                    acc[tm][tn] += a_reg[tm] * b_reg[tn];
+        }
+
         __syncthreads();
     }
 
-    if (row < M && col < N) C[row * N + col] = acc;
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        int r = row_base + ty * TM + tm;
+        if (r >= M) break;
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            int c = col_base + tx * TN + tn;
+            if (c < N) C[r * N + c] = acc[tm][tn];
+        }
+    }
 }
 
 void launch_gemm_tn(const float* dA, const float* dB, float* dC,
                     int M, int N, int K, cudaStream_t stream) {
-    dim3 block(TILE, TILE);
-    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    gemm_tn_kernel<<<grid, block, 0, stream>>>(dA, dB, dC, M, N, K);
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_tn_reg_kernel<<<grid, block, 0, stream>>>(dA, dB, dC, M, N, K);
     CUDA_CHECK_LAST();
 }
 
 void launch_gemm_nt(const float* dA, const float* dB, float* dC,
                     int M, int N, int K, cudaStream_t stream) {
-    dim3 block(TILE, TILE);
-    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    gemm_nt_kernel<<<grid, block, 0, stream>>>(dA, dB, dC, M, N, K);
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_nt_reg_kernel<<<grid, block, 0, stream>>>(dA, dB, dC, M, N, K);
     CUDA_CHECK_LAST();
 }

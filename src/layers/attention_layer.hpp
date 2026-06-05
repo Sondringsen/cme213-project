@@ -32,15 +32,30 @@ struct MultiHeadAttention {
     Linear W_v;    // (C, C)
     Linear W_out;  // (C, C)
 
-    // Owned intermediate buffers (sized for max B*S*C)
-    Tensor<float> Q_flat;   // (B*S, C) — Q projected
+    // Forward intermediate buffers
+    Tensor<float> Q_flat;   // (B*S, C)
     Tensor<float> K_flat;   // (B*S, C)
     Tensor<float> V_flat;   // (B*S, C)
     Tensor<float> Q_bhsd;   // (B, H, S, D)
     Tensor<float> K_bhsd;   // (B, H, S, D)
     Tensor<float> V_bhsd;   // (B, H, S, D)
-    Tensor<float> O_bhsd;   // (B, H, S, D) — attention output
-    Tensor<float> O_flat;   // (B*S, C) — reshaped output
+    Tensor<float> O_bhsd;   // (B, H, S, D)
+    Tensor<float> O_flat;   // (B*S, C)
+
+    // Backward scratch buffers — pre-allocated once to avoid per-step cudaMalloc.
+    // The attention backward materializes two S×S matrices (P and dP) per
+    // batch*head; allocating them here amortizes the ~30 ms/step allocation cost.
+    Tensor<float> d_O_flat_buf;   // (B*S, C)
+    Tensor<float> d_O_bhsd_buf;   // (B, H, S, D)
+    Tensor<float> d_Q_bhsd_buf;   // (B, H, S, D)
+    Tensor<float> d_K_bhsd_buf;   // (B, H, S, D)
+    Tensor<float> d_V_bhsd_buf;   // (B, H, S, D)
+    Tensor<float> d_Q_flat_buf;   // (B*S, C)
+    Tensor<float> d_K_flat_buf;   // (B*S, C)
+    Tensor<float> d_V_flat_buf;   // (B*S, C)
+    Tensor<float> tmp_buf;        // (B*S, C) — W_q/k/v backward scratch
+    Tensor<float> attn_P_buf;     // (B*H, S*S) — attention weights
+    Tensor<float> attn_dP_buf;    // (B*H, S*S) — attention weight gradients
 
     MultiHeadAttention(int B_, int H_, int S_, int D_, bool causal_ = true)
         : B(B_), H(H_), S(S_), D(D_), C(H_ * D_),
@@ -51,7 +66,18 @@ struct MultiHeadAttention {
           Q_bhsd({B_, H_, S_, D_}), K_bhsd({B_, H_, S_, D_}),
           V_bhsd({B_, H_, S_, D_}),
           O_bhsd({B_, H_, S_, D_}),
-          O_flat({B_* S_, C}) {}
+          O_flat({B_* S_, C}),
+          d_O_flat_buf({B_* S_, C}),
+          d_O_bhsd_buf({B_, H_, S_, D_}),
+          d_Q_bhsd_buf({B_, H_, S_, D_}),
+          d_K_bhsd_buf({B_, H_, S_, D_}),
+          d_V_bhsd_buf({B_, H_, S_, D_}),
+          d_Q_flat_buf({B_* S_, C}),
+          d_K_flat_buf({B_* S_, C}),
+          d_V_flat_buf({B_* S_, C}),
+          tmp_buf({B_* S_, C}),
+          attn_P_buf({B_* H_, S_* S_}),
+          attn_dP_buf({B_* H_, S_* S_}) {}
 
     // forward: x (B*S, C) → out (B*S, C)
     void forward(const float* x, float* out, cudaStream_t stream = 0) {
@@ -83,38 +109,34 @@ struct MultiHeadAttention {
         int N = B * S;
 
         // 5b. Backward through output projection
-        Tensor<float> d_O_flat({N, C});
-        W_out.backward(d_out, d_O_flat.data(), stream);
+        W_out.backward(d_out, d_O_flat_buf.data(), stream);
 
         // 4b. Reshape d_O_flat (N, C) → d_O_bhsd (B, H, S, D)
-        Tensor<float> d_O_bhsd({B, H, S, D});
-        launch_flat_to_bhsd(d_O_flat.data(), d_O_bhsd.data(), B, H, S, D, stream);
+        launch_flat_to_bhsd(d_O_flat_buf.data(), d_O_bhsd_buf.data(), B, H, S, D, stream);
 
-        // 3b. Attention backward
-        Tensor<float> d_Q_bhsd({B, H, S, D}), d_K_bhsd({B, H, S, D}), d_V_bhsd({B, H, S, D});
+        // 3b. Attention backward (uses pre-allocated P and dP scratch buffers)
         launch_attention_backward(Q_bhsd.data(), K_bhsd.data(), V_bhsd.data(),
-                                  d_O_bhsd.data(),
-                                  d_Q_bhsd.data(), d_K_bhsd.data(), d_V_bhsd.data(),
-                                  B, H, S, D, scale, causal, stream);
+                                  d_O_bhsd_buf.data(),
+                                  d_Q_bhsd_buf.data(), d_K_bhsd_buf.data(), d_V_bhsd_buf.data(),
+                                  B, H, S, D, scale, causal,
+                                  attn_P_buf.data(), attn_dP_buf.data(), stream);
 
         // 2b. Reshape (B, H, S, D) → (N, C)
-        Tensor<float> d_Q_flat({N, C}), d_K_flat({N, C}), d_V_flat({N, C});
-        launch_bhsd_to_flat(d_Q_bhsd.data(), d_Q_flat.data(), B, H, S, D, stream);
-        launch_bhsd_to_flat(d_K_bhsd.data(), d_K_flat.data(), B, H, S, D, stream);
-        launch_bhsd_to_flat(d_V_bhsd.data(), d_V_flat.data(), B, H, S, D, stream);
+        launch_bhsd_to_flat(d_Q_bhsd_buf.data(), d_Q_flat_buf.data(), B, H, S, D, stream);
+        launch_bhsd_to_flat(d_K_bhsd_buf.data(), d_K_flat_buf.data(), B, H, S, D, stream);
+        launch_bhsd_to_flat(d_V_bhsd_buf.data(), d_V_flat_buf.data(), B, H, S, D, stream);
 
         // 1b. Backward through Q, K, V projections
         //     d_x accumulates contributions from all three; must zero first
         cudaMemsetAsync(d_x, 0, static_cast<size_t>(N) * C * sizeof(float), stream);
-        Tensor<float> tmp({N, C});
 
-        W_q.backward(d_Q_flat.data(), tmp.data(), stream);
-        launch_add_inplace(d_x, tmp.data(), N * C, stream);
+        W_q.backward(d_Q_flat_buf.data(), tmp_buf.data(), stream);
+        launch_add_inplace(d_x, tmp_buf.data(), N * C, stream);
 
-        W_k.backward(d_K_flat.data(), tmp.data(), stream);
-        launch_add_inplace(d_x, tmp.data(), N * C, stream);
+        W_k.backward(d_K_flat_buf.data(), tmp_buf.data(), stream);
+        launch_add_inplace(d_x, tmp_buf.data(), N * C, stream);
 
-        W_v.backward(d_V_flat.data(), tmp.data(), stream);
-        launch_add_inplace(d_x, tmp.data(), N * C, stream);
+        W_v.backward(d_V_flat_buf.data(), tmp_buf.data(), stream);
+        launch_add_inplace(d_x, tmp_buf.data(), N * C, stream);
     }
 };

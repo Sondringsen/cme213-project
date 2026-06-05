@@ -81,10 +81,24 @@ __global__ void layernorm_forward_kernel(const float* __restrict__ x,
     // Optionally save rstd for the backward pass.
     if (tid == 0 && rstd_out) rstd_out[row] = rstd;
 
-    // ---- Pass 2b: write normalized + affine output ----
-    for (int i = tid; i < H; i += LN_BLOCK) {
-        float v = row_x[i];
-        row_y[i] = gamma[i] * (v - mean) * rstd + beta[i];
+    // ---- Pass 2b: write normalized + affine output (float4 vectorized) ----
+    // H is assumed to be a multiple of 4 (true for all realistic hidden sizes).
+    // Each thread processes 4 consecutive elements per iteration for wider
+    // memory transactions: 3 reads (x, gamma, beta) + 1 write (y) per element.
+    for (int i = tid * 4; i + 3 < H; i += LN_BLOCK * 4) {
+        float4 xi = reinterpret_cast<const float4*>(row_x)[i / 4];
+        float4 gi = reinterpret_cast<const float4*>(gamma)[i / 4];
+        float4 bi = reinterpret_cast<const float4*>(beta)[i / 4];
+        float4 yi;
+        yi.x = gi.x * (xi.x - mean) * rstd + bi.x;
+        yi.y = gi.y * (xi.y - mean) * rstd + bi.y;
+        yi.z = gi.z * (xi.z - mean) * rstd + bi.z;
+        yi.w = gi.w * (xi.w - mean) * rstd + bi.w;
+        reinterpret_cast<float4*>(row_y)[i / 4] = yi;
+    }
+    // Scalar tail for the rare case H % 4 != 0
+    for (int i = (H / 4) * 4 + tid; i < H; i += LN_BLOCK) {
+        row_y[i] = gamma[i] * (row_x[i] - mean) * rstd + beta[i];
     }
 }
 

@@ -30,6 +30,8 @@ void launch_flash_attention_forward(const float* dQ,
                                     float scale, bool causal,
                                     cudaStream_t stream = 0);
 
+// P_buf and dP_buf must each point to B*H*S*S pre-allocated device floats.
+// The caller owns these buffers; this function does not allocate or free them.
 void launch_attention_backward(const float* Q,
                                const float* K,
                                const float* V,
@@ -39,4 +41,5 @@ void launch_attention_backward(const float* Q,
                                float* dV,
                                int B, int H, int S, int D,
                                float scale, bool causal,
+                               float* P_buf, float* dP_buf,
                                cudaStream_t stream = 0);

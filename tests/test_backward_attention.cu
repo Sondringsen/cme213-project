@@ -127,6 +127,7 @@ static int run_case(int B, int H, int S, int D, bool causal) {
 
     Tensor<float> Q({B,H,S,D}), K({B,H,S,D}), V({B,H,S,D}), dO({B,H,S,D});
     Tensor<float> dQ({B,H,S,D}), dK({B,H,S,D}), dV({B,H,S,D});
+    Tensor<float> P_buf({B*H, S*S}), dP_buf({B*H, S*S});
 
     Q.copy_from_host(hQ.data());
     K.copy_from_host(hK.data());
@@ -136,7 +137,8 @@ static int run_case(int B, int H, int S, int D, bool causal) {
 
     launch_attention_backward(Q.data(), K.data(), V.data(), dO.data(),
                               dQ.data(), dK.data(), dV.data(),
-                              B, H, S, D, scale, causal);
+                              B, H, S, D, scale, causal,
+                              P_buf.data(), dP_buf.data());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> gpu_dQ(total), gpu_dK(total), gpu_dV(total);
