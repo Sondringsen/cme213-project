@@ -30,7 +30,6 @@ struct DataLoader {
             targets[i] = tokens[(pos + 1) % n];
             ++pos;
         }
-        // Keep pos in [0, n-1) so the wrap stays valid
-        if (pos >= n - 1) pos = 0;
+        pos %= n;
     }
 };

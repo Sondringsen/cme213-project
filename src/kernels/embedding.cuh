@@ -30,3 +30,13 @@ void launch_embedding_backward(const float* d_out,
                                float*       d_weight,
                                int N, int V, int D,
                                cudaStream_t stream = 0);
+
+// Positional embedding: adds pos_embed[n % S, :] to out[n, :] in-place.
+void launch_pos_embed_forward(const float* pos_embed, float* out,
+                              int B, int S, int C,
+                              cudaStream_t stream = 0);
+
+// Positional embedding backward: d_pos_embed[s, :] += sum_b d_out[b*S+s, :]
+void launch_pos_embed_backward(const float* d_out, float* d_pos_embed,
+                               int B, int S, int C,
+                               cudaStream_t stream = 0);

@@ -1,7 +1,10 @@
 // main_inference.cu — Load a saved GPT-2 checkpoint and generate text.
 //
 // Usage:
-//   ./build/run_inference <checkpoint> <vocab.txt> "<prompt>" [n_tokens=50]
+//   ./build/run_inference <checkpoint> <vocab.txt> "<prompt>" [n_tokens=50] [temperature=1.0]
+//
+// temperature=0  → greedy argmax
+// temperature>0  → sample from softmax (use ~0.8 for more coherent output)
 //
 // The prompt is tokenized the same way as prepare_data.py:
 //   lowercase → strip non-[a-z0-9 ' < >] → split on whitespace
@@ -13,9 +16,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -70,7 +76,8 @@ int main(int argc, char** argv) {
     const std::string ckpt_path  = argv[1];
     const std::string vocab_path = argv[2];
     const std::string prompt_str = argv[3];
-    int n_gen = (argc > 4) ? std::atoi(argv[4]) : 50;
+    int   n_gen = (argc > 4) ? std::atoi(argv[4]) : 50;
+    float temp  = (argc > 5) ? std::atof(argv[5]) : 1.0f;
 
     // ── Load vocab ──────────────────────────────────────────────────────────
     auto vocab = load_vocab(vocab_path);
@@ -103,6 +110,8 @@ int main(int argc, char** argv) {
     for (int id : context)
         std::printf("%s ", vocab[static_cast<size_t>(id)].c_str());
 
+    std::mt19937 rng(std::random_device{}());
+
     // ── Device buffer: one sequence of length S ──────────────────────────────
     const int S = cfg.S;
     const int V = cfg.V;
@@ -133,8 +142,22 @@ int main(int argc, char** argv) {
         int last_pos = std::min(ctx_len, S) - 1;
         const float* row = h_logits.data() + static_cast<size_t>(last_pos) * V;
 
-        // Greedy argmax
-        int next_tok = static_cast<int>(std::max_element(row, row + V) - row);
+        int next_tok;
+        if (temp == 0.0f) {
+            next_tok = static_cast<int>(std::max_element(row, row + V) - row);
+        } else {
+            // Softmax with temperature then sample
+            float max_logit = *std::max_element(row, row + V);
+            std::vector<float> probs(V);
+            float sum = 0.0f;
+            for (int i = 0; i < V; ++i) {
+                probs[i] = std::exp((row[i] - max_logit) / temp);
+                sum += probs[i];
+            }
+            for (float& p : probs) p /= sum;
+            std::discrete_distribution<int> dist(probs.begin(), probs.end());
+            next_tok = dist(rng);
+        }
 
         context.push_back(next_tok);
         std::printf("%s ", vocab[static_cast<size_t>(next_tok)].c_str());

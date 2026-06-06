@@ -23,6 +23,7 @@
 #include "layers/layernorm_layer.hpp"
 #include "layers/linear.hpp"
 #include "utils/tensor.hpp"
+#include <random>
 #include <vector>
 #include <cstdio>
 
@@ -39,9 +40,11 @@ struct GPT2 {
     GPT2Config cfg;
 
     EmbeddingLayer              embed;
+    Tensor<float>               pos_embed;    // (S, C) learned position embeddings
+    Tensor<float>               d_pos_embed;  // gradient w.r.t. pos_embed
     std::vector<TransformerBlock*> blocks;  // owning pointers
     LayerNormLayer              final_ln;
-    Linear                      lm_head;   // (V, C) — tied with embed.weight
+    Linear                      lm_head;
 
     // Intermediate activations (device, owned)
     Tensor<float> embed_out;    // (B*S, C)
@@ -58,6 +61,8 @@ struct GPT2 {
     explicit GPT2(const GPT2Config& config)
         : cfg(config),
           embed(config.V, config.C),
+          pos_embed({config.S, config.C}),
+          d_pos_embed({config.S, config.C}),
           final_ln(config.C, config.B * config.S),
           lm_head(config.C, config.V),
           embed_out({config.B * config.S, config.C}),
@@ -77,11 +82,17 @@ struct GPT2 {
         init_weights();
     }
 
-    // Xavier-initialize all linear weights with unique per-layer seeds.
-    // LayerNorm gamma/beta are already set to 1/0 in LayerNormLayer's
-    // constructor; embedding weights are set in EmbeddingLayer's constructor.
     void init_weights(unsigned base = 42) {
         unsigned s = base;
+        // GPT-2 initializes position embeddings with N(0, 0.02).
+        {
+            std::mt19937 gen(s++);
+            std::normal_distribution<float> dist(0.0f, 0.02f);
+            std::vector<float> h(static_cast<size_t>(cfg.S) * cfg.C);
+            for (auto& v : h) v = dist(gen);
+            pos_embed.copy_from_host(h.data());
+            d_pos_embed.zero();
+        }
         lm_head.init_xavier(s++);
         for (auto* b : blocks) {
             b->mha.W_q.init_xavier(s++);
@@ -106,6 +117,8 @@ struct GPT2 {
         int N = cfg.B * cfg.S;
 
         embed.forward(ids, embed_out.data(), N, stream);
+        launch_pos_embed_forward(pos_embed.data(), embed_out.data(),
+                                 cfg.B, cfg.S, cfg.C, stream);
 
         // Copy embed_out into block_in for the first block
         cudaMemcpyAsync(block_in.data(), embed_out.data(),
@@ -146,6 +159,9 @@ struct GPT2 {
 
         // Embedding backward (scatter-add into embed.d_weight)
         embed.backward(d_block.data(), stream);
+        // Position embedding backward (sum over B sequences per position)
+        launch_pos_embed_backward(d_block.data(), d_pos_embed.data(),
+                                  cfg.B, cfg.S, cfg.C, stream);
     }
 
     // Collect all (param, grad, n_elements) tuples for the Adam step.
@@ -163,6 +179,7 @@ struct GPT2 {
         };
 
         add(embed.weight.data(), embed.d_weight.data(), embed.weight.numel());
+        add(pos_embed.data(), d_pos_embed.data(), pos_embed.numel());
         for (auto* b : blocks) {
             // LayerNorm 1
             add(b->ln1.gamma.data(), b->ln1.d_gamma.data(), b->ln1.gamma.numel());
@@ -192,6 +209,7 @@ struct GPT2 {
     // Zero all parameter gradients. Call before each backward pass.
     void zero_grad(cudaStream_t stream = 0) {
         embed.d_weight.zero();
+        d_pos_embed.zero();
         for (auto* b : blocks) {
             b->ln1.d_gamma.zero(); b->ln1.d_beta.zero();
             b->mha.W_q.d_W.zero();

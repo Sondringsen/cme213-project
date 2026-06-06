@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
 
     // ---- Trainer (owns Adam moment buffers) ----
     TrainerConfig tcfg;
-    tcfg.lr = 1e-3f;
+    tcfg.lr = 3e-4f;
     Trainer trainer(model, tcfg);
 
     // ---- Data loader (optional) ----
