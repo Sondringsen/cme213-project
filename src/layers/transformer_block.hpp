@@ -41,6 +41,10 @@ struct TransformerBlock {
     Tensor<float> gelu_out;   // GELU(fc1_out)
 
     // Pre-allocated backward scratch — avoids per-step cudaMalloc.
+    // x_buf: stable per-block copy of the block's input x. ln1.x_cache is set
+    // to x_buf.data() so it survives the GPT2 forward loop, which overwrites
+    // the shared block_in buffer that x originally points into.
+    Tensor<float> x_buf;          // (B*S, C)
     Tensor<float> d_h_buf;        // (B*S, C)
     Tensor<float> d_gelu_out_buf; // (B*S, FC)
     Tensor<float> d_fc1_out_buf;  // (B*S, FC)
@@ -63,6 +67,7 @@ struct TransformerBlock {
           ln2_out({B * S, C_}),
           fc1_out({B * S, 4 * C_}),
           gelu_out({B * S, 4 * C_}),
+          x_buf({B * S, C_}),
           d_h_buf({B * S, C_}),
           d_gelu_out_buf({B * S, 4 * C_}),
           d_fc1_out_buf({B * S, 4 * C_}),
@@ -74,13 +79,17 @@ struct TransformerBlock {
     // forward: x (B*S, C) → out (B*S, C)
     void forward(const float* x, float* out, cudaStream_t stream = 0) {
         int N = static_cast<int>(ln1_out.numel() / C);
+        size_t bytes = static_cast<size_t>(N) * C * sizeof(float);
+
+        // Save a stable per-block copy of x so ln1.x_cache survives the
+        // GPT2 forward loop, which overwrites the shared block_in buffer.
+        cudaMemcpyAsync(x_buf.data(), x, bytes, cudaMemcpyDeviceToDevice, stream);
 
         // ---- Attention sub-layer ----
-        ln1.forward(x, ln1_out.data(), N, stream);
+        ln1.forward(x_buf.data(), ln1_out.data(), N, stream);
         mha.forward(ln1_out.data(), attn_out.data(), stream);
         // h = x + attn_out  (residual)
-        cudaMemcpyAsync(h.data(), x, static_cast<size_t>(N) * C * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(h.data(), x_buf.data(), bytes, cudaMemcpyDeviceToDevice, stream);
         launch_add_inplace(h.data(), attn_out.data(), N * C, stream);
 
         // ---- FFN sub-layer ----

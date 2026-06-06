@@ -74,10 +74,10 @@ Loads a saved checkpoint and generates text autoregressively. No MPI needed.
 
 ```bash
 # temperature=0 → greedy argmax (may loop on undertrained models)
-./build/run_inference checkpoints/wikitext_6l.ckpt data/vocab.txt "the president said" 80 0
+srun --partition=gpu-turing --gres=gpu:1 ./build/run_inference checkpoints/wikitext_6l.ckpt data/vocab.txt "the president said" 80 0
 
 # temperature=0.8 → sampled (more varied output)
-./build/run_inference checkpoints/wikitext_6l.ckpt data/vocab.txt "the president said" 80 0.8
+srun --partition=gpu-turing --gres=gpu:1 ./build/run_inference checkpoints/wikitext_6l.ckpt data/vocab.txt "the president said" 80 0.8
 ```
 
 Usage: `run_inference <checkpoint> <vocab.txt> "<prompt>" [n_tokens=50] [temperature=1.0]`
