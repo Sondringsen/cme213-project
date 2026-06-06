@@ -20,15 +20,19 @@
 //   mpirun -np 4 ./train_distributed [n_steps] [n_layers] [C] [S] [total_B]
 // ===========================================================================
 
+#include "data/data_loader.hpp"
 #include "model/gpt2.hpp"
 #include "mpi/data_parallel.hpp"
 #include "training/trainer.hpp"
 #include "utils/cuda_check.hpp"
+#include "utils/model_io.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
+#include <string>
 #include <vector>
 #include <chrono>
 
@@ -61,11 +65,13 @@ static void gen_batch(int* ids, int* targets, int total_tokens, int V,
 
 int main(int argc, char** argv) {
     // Parse optional CLI arguments
-    int n_steps   = (argc > 1) ? std::atoi(argv[1]) : 20;
-    int n_layers  = (argc > 2) ? std::atoi(argv[2]) : 4;
-    int C         = (argc > 3) ? std::atoi(argv[3]) : 128;
-    int S         = (argc > 4) ? std::atoi(argv[4]) : 64;
-    int total_B   = (argc > 5) ? std::atoi(argv[5]) : 8;  // global batch
+    int         n_steps    = (argc > 1) ? std::atoi(argv[1]) : 20;
+    int         n_layers   = (argc > 2) ? std::atoi(argv[2]) : 4;
+    int         C          = (argc > 3) ? std::atoi(argv[3]) : 128;
+    int         S          = (argc > 4) ? std::atoi(argv[4]) : 64;
+    int         total_B    = (argc > 5) ? std::atoi(argv[5]) : 8;  // global batch
+    std::string data_path  = (argc > 6) ? argv[6] : "";
+    std::string ckpt_path  = (argc > 7) ? argv[7] : "";
 
     // ---- MPI init ----
     mpi_init(argc, argv);
@@ -83,10 +89,18 @@ int main(int argc, char** argv) {
 
     int local_B = total_B / n_ranks;
 
+    bool use_real_data = !data_path.empty();
+
     if (rank == 0) {
         std::printf("=== Distributed GPT-2 training ===\n");
         std::printf("  ranks=%d  local_B=%d  S=%d  C=%d  layers=%d  steps=%d\n",
                     n_ranks, local_B, S, C, n_layers, n_steps);
+        if (use_real_data)
+            std::printf("  data=%s\n", data_path.c_str());
+        else
+            std::printf("  data=synthetic (V=512)\n");
+        if (!ckpt_path.empty())
+            std::printf("  checkpoint=%s\n", ckpt_path.c_str());
     }
 
     // ---- Model construction ----
@@ -94,7 +108,7 @@ int main(int argc, char** argv) {
     cfg.n_layers = n_layers;
     cfg.n_heads  = (C >= 128) ? 8 : 4;   // keep head_dim ≥ 16
     cfg.C        = C;
-    cfg.V        = 512;    // small vocab for the synthetic demo
+    cfg.V        = use_real_data ? 10000 : 512;
     cfg.S        = S;
     cfg.B        = local_B;
 
@@ -107,6 +121,23 @@ int main(int argc, char** argv) {
     TrainerConfig tcfg;
     tcfg.lr = 1e-3f;
     Trainer trainer(model, tcfg);
+
+    // ---- Data loader (optional) ----
+    // Each rank constructs its own loader and advances in lockstep, so ranks
+    // always hold the same full-batch view and scatter_batch slices correctly.
+    std::unique_ptr<DataLoader> loader;
+    if (use_real_data) {
+        try {
+            loader = std::make_unique<DataLoader>(data_path);
+            if (rank == 0)
+                std::printf("  tokens in file: %zu\n", loader->tokens.size());
+        } catch (const std::exception& e) {
+            if (rank == 0)
+                std::fprintf(stderr, "[Error] %s\n", e.what());
+            mpi_finalize();
+            return 1;
+        }
+    }
 
     // ---- Host batch buffers ----
     int global_tokens = total_B  * S;
@@ -131,11 +162,15 @@ int main(int argc, char** argv) {
         std::snprintf(step_label, sizeof(step_label), "step_%d", step);
         NVTX_PUSH(step_label);
 
-        // Generate the same global batch on every rank (same seed), then
-        // slice the local portion.  Using the step as the seed means each
-        // step has a fresh batch.
-        gen_batch(h_full_ids.data(), h_full_targets.data(),
-                  global_tokens, cfg.V, static_cast<unsigned>(step));
+        // Fill the global batch buffer then slice the local portion.
+        if (use_real_data) {
+            // All ranks advance their loader in lockstep so scatter is consistent.
+            loader->next_batch(h_full_ids.data(), h_full_targets.data(),
+                               global_tokens);
+        } else {
+            gen_batch(h_full_ids.data(), h_full_targets.data(),
+                      global_tokens, cfg.V, static_cast<unsigned>(step));
+        }
 
         scatter_batch(h_full_ids.data(), h_full_targets.data(),
                       h_local_ids.data(), h_local_tgts.data(),
@@ -195,6 +230,16 @@ int main(int argc, char** argv) {
                     "avg_step_ms=%.2f comm_fraction=%.3f\n",
                     n_ranks, local_B, S, C, n_layers,
                     avg_step, avg_comm / avg_step);
+    }
+
+    // ---- Save checkpoint (rank 0 only) ----
+    if (rank == 0 && !ckpt_path.empty()) {
+        try {
+            save_model(model, ckpt_path);
+            std::printf("Checkpoint saved → %s\n", ckpt_path.c_str());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[Error] save_model: %s\n", e.what());
+        }
     }
 
     CUDA_CHECK(cudaFree(d_ids));

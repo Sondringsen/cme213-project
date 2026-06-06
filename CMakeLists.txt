@@ -120,3 +120,18 @@ if(MPI_FOUND)
         message(STATUS "nvToolsExt found — NVTX annotations enabled for train_distributed")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# MPI allreduce latency benchmark (requires MPI)
+# ---------------------------------------------------------------------------
+if(MPI_FOUND)
+    add_executable(allreduce_bench benchmarks/allreduce_bench.cu)
+    target_link_libraries(allreduce_bench PRIVATE MPI::MPI_CXX)
+endif()
+
+# ---------------------------------------------------------------------------
+# Inference binary (no MPI needed — single GPU)
+# ---------------------------------------------------------------------------
+add_executable(run_inference src/main_inference.cu)
+target_link_libraries(run_inference PRIVATE llm)
+target_include_directories(run_inference PRIVATE ${CMAKE_SOURCE_DIR}/src)

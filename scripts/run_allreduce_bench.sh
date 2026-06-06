@@ -11,7 +11,7 @@
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
-rm -rf build && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 . && cmake --build build --target allreduce_bench -j4
+rm -rf build && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 . && cmake --build build -j4
 
 echo "=== MPI Allreduce Latency Benchmark ==="
 echo "Node: $SLURMD_NODENAME"
