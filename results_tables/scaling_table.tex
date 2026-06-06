@@ -1,0 +1,16 @@
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{r r r r | r r r}
+    \toprule
+    \multicolumn{4}{c|}{\textbf{Strong Scaling} (total $B=16$)} & \multicolumn{3}{c}{\textbf{Weak Scaling} (local $B=4$/rank)} \\
+    $P$ & Step (ms) & Speedup & Efficiency & Step (ms) & Norm.\ time & Efficiency \\
+    \midrule
+    1 & 149.4 & 1.00\times & 100.0\% & 43.8 & 1.00\times & 100.0\% \\
+    2 & 93.7 & 1.59\times & 79.7\% & 57.9 & 1.32\times & 75.6\% \\
+    4 & 60.5 & 2.47\times & 61.8\% & 60.5 & 1.38\times & 72.4\% \\
+    \bottomrule
+  \end{tabular}
+  \caption{Strong and weak scaling on up to 4 Quadro RTX 6000 GPUs. Strong scaling: total batch $B=16$, $S=128$, $C=256$, 6 layers. Weak scaling: local batch $B_\text{local}=4$ per rank. Efficiency $= T(1)/(P \cdot T(P))$ (strong) and $T(1)/T(P)$ (weak).}
+  \label{tab:scaling}
+\end{table}
