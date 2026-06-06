@@ -223,7 +223,21 @@ intermediate copy.
 **Expected gain:** ~50 α-latencies eliminated. Before: ~50 × 300 µs ≈ 14 ms. After:
 1 × α + β × total_grad_bytes ≈ 300 µs + 850 µs ≈ 1.2 ms.
 
-**Report numbers to fill in:** `comm ms` at 4 ranks before/after from `run_distributed.sh`.
+**Measured results (4 ranks, strong scaling):**
+- Before: comm = 18.58 ms, step = 74.01 ms
+- After: comm = 15.64 ms, step = 59.80 ms
+
+**Why comm only dropped ~3 ms instead of the predicted ~12 ms:** All 4 ranks ran on the
+same node (hpcc-gpu-5-1), so MPI uses shared-memory transport where α ≈ 10 µs, not
+the 300 µs assumed for cross-node Ethernet. 50 × 10 µs = only 0.5 ms of latency saved
+by fusing. The dominant cost (~15 ms) is PCIe bandwidth for D→H→D transfers of ~19 MB
+of gradients at ~10 GB/s — unavoidable without CUDA-aware MPI, which would allreduce
+directly over NVLink and skip the PCIe copies entirely. Good future-work discussion
+point for the report.
+
+The ~14 ms total step improvement at 4 ranks includes both the fused allreduce benefit
+and the TransformerBlock scratch pre-allocation (entry 7); the 1-rank step drop of ~9 ms
+isolates the allocation overhead alone.
 
 ---
 
