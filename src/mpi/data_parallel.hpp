@@ -112,34 +112,51 @@ inline void broadcast_weights(GPT2& model) {
 // allreduce_gradients — sum gradients across all ranks then divide by n_ranks.
 // After this call every rank holds the same averaged gradient, so identical
 // Adam steps will keep weights synchronized.
+//
+// All gradients are packed into one pinned host buffer (lazy-allocated on
+// first call), reducing ~50 per-tensor MPI_Allreduce calls to one.
+// Pinned memory enables full PCIe DMA bandwidth on the D↔H transfers.
 // ---------------------------------------------------------------------------
 inline void allreduce_gradients(GPT2& model) {
 #ifdef MPI_ENABLED
     if (mpi_state::size == 1) return;
 
-    float inv_n = 1.0f / static_cast<float>(mpi_state::size);
-    auto  pg    = model.param_grads();
+    auto pg = model.param_grads();
 
+    // Lazy-allocate a pinned host buffer sized to hold all gradients.
+    static float* s_buf   = nullptr;
+    static int    s_total = 0;
+
+    int total = 0;
+    for (auto& p : pg) total += p.n;
+
+    if (s_buf == nullptr || total != s_total) {
+        if (s_buf) cudaFreeHost(s_buf);
+        cudaMallocHost(&s_buf, static_cast<size_t>(total) * sizeof(float));
+        s_total = total;
+    }
+
+    // Pack all gradients from GPU into the contiguous host buffer.
+    float* ptr = s_buf;
     for (auto& p : pg) {
-        // Copy gradient to host (grad pointer is const — cast is safe because
-        // the underlying Tensor<float> is non-const; the const is just the
-        // optimizer convention that it won't modify the gradient).
-        std::vector<float> h_grad(static_cast<size_t>(p.n));
-        cudaMemcpy(h_grad.data(), p.grad,
+        cudaMemcpy(ptr, p.grad,
                    static_cast<size_t>(p.n) * sizeof(float),
                    cudaMemcpyDeviceToHost);
+        ptr += p.n;
+    }
 
-        // MPI_IN_PLACE sums into the same buffer on every rank.
-        MPI_Allreduce(MPI_IN_PLACE, h_grad.data(), p.n,
-                      MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+    // One MPI_Allreduce on the full buffer instead of ~50 per-tensor calls.
+    MPI_Allreduce(MPI_IN_PLACE, s_buf, s_total, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
 
-        // Scale from sum → average.
-        for (int i = 0; i < p.n; ++i) h_grad[i] *= inv_n;
-
-        // Write averaged gradient back to device.
-        cudaMemcpy(const_cast<float*>(p.grad), h_grad.data(),
+    // Scale from sum → average and scatter back to device.
+    float inv_n = 1.0f / static_cast<float>(mpi_state::size);
+    ptr = s_buf;
+    for (auto& p : pg) {
+        for (int i = 0; i < p.n; ++i) ptr[i] *= inv_n;
+        cudaMemcpy(const_cast<float*>(p.grad), ptr,
                    static_cast<size_t>(p.n) * sizeof(float),
                    cudaMemcpyHostToDevice);
+        ptr += p.n;
     }
 #else
     (void)model;

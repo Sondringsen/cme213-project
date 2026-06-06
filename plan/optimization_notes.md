@@ -185,6 +185,48 @@ After: no allocation in the critical path; step time should drop measurably.
 
 ---
 
+## 7. TransformerBlock backward scratch buffer pre-allocation
+**File:** `src/layers/transformer_block.hpp`
+
+**Problem:** `TransformerBlock::backward()` allocated 7 `Tensor<float>` temporaries on
+every backward call (`d_h`, `d_gelu_out`, `d_fc1_out`, `d_ln2_out`, `d_h_ffn`,
+`d_ln1_out`, `d_x_attn`). Each triggers a `cudaMalloc`/`cudaFree` pair, and with
+N_layers blocks per step the allocations compound. The attention layer's scratch was
+already pre-allocated (entry 6), making the TransformerBlock the remaining source of
+per-step cudaMalloc noise.
+
+**Fix:** All 7 temporaries are now member variables (`d_h_buf`, `d_gelu_out_buf`,
+`d_fc1_out_buf`, `d_ln2_out_buf`, `d_h_ffn_buf`, `d_ln1_out_buf`, `d_x_attn_buf`),
+initialized in the constructor alongside the existing forward buffers. `backward()`
+writes directly into them with no allocation in the critical path.
+
+**Report numbers to fill in:** Step time (1 rank, no comm) before/after from
+`run_distributed.sh`; the difference isolates the allocation overhead.
+
+---
+
+## 8. Fused MPI AllReduce with pinned host buffer
+**File:** `src/mpi/data_parallel.hpp`
+
+**Problem:** `allreduce_gradients()` called `MPI_Allreduce` once per parameter tensor
+(~50 calls for a 4-layer model). Each call incurs a startup latency α ≈ 100–300 µs,
+totalling ~14 ms/step that is pure latency overhead, not bandwidth-limited. The function
+also allocated a `std::vector<float>` per tensor per step (heap alloc + dealloc × 50).
+
+**Fix:** All gradients are packed into a single contiguous pinned host buffer, then one
+`MPI_Allreduce` is issued on the full buffer, and results are scattered back.
+The buffer is lazy-allocated (static local, `cudaMallocHost`) on the first call and
+reused every subsequent step. Pinned memory enables full PCIe DMA bandwidth (~16 GB/s)
+for the D→H and H→D transfers, versus pageable memory which goes through an extra
+intermediate copy.
+
+**Expected gain:** ~50 α-latencies eliminated. Before: ~50 × 300 µs ≈ 14 ms. After:
+1 × α + β × total_grad_bytes ≈ 300 µs + 850 µs ≈ 1.2 ms.
+
+**Report numbers to fill in:** `comm ms` at 4 ranks before/after from `run_distributed.sh`.
+
+---
+
 ## Profiling script changes
 **File:** `run_profile.sh`
 

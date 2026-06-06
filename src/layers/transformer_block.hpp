@@ -40,6 +40,15 @@ struct TransformerBlock {
     Tensor<float> fc1_out;    // FC1 pre-GELU
     Tensor<float> gelu_out;   // GELU(fc1_out)
 
+    // Pre-allocated backward scratch — avoids per-step cudaMalloc.
+    Tensor<float> d_h_buf;        // (B*S, C)
+    Tensor<float> d_gelu_out_buf; // (B*S, FC)
+    Tensor<float> d_fc1_out_buf;  // (B*S, FC)
+    Tensor<float> d_ln2_out_buf;  // (B*S, C)
+    Tensor<float> d_h_ffn_buf;    // (B*S, C)
+    Tensor<float> d_ln1_out_buf;  // (B*S, C)
+    Tensor<float> d_x_attn_buf;   // (B*S, C)
+
     // N = B*S is fixed at construction time (simplifies buffer sizes)
     TransformerBlock(int C_, int H_attn, int S, int B, bool causal = true)
         : C(C_), FC(4 * C_),
@@ -53,7 +62,14 @@ struct TransformerBlock {
           h({B * S, C_}),
           ln2_out({B * S, C_}),
           fc1_out({B * S, 4 * C_}),
-          gelu_out({B * S, 4 * C_}) {}
+          gelu_out({B * S, 4 * C_}),
+          d_h_buf({B * S, C_}),
+          d_gelu_out_buf({B * S, 4 * C_}),
+          d_fc1_out_buf({B * S, 4 * C_}),
+          d_ln2_out_buf({B * S, C_}),
+          d_h_ffn_buf({B * S, C_}),
+          d_ln1_out_buf({B * S, C_}),
+          d_x_attn_buf({B * S, C_}) {}
 
     // forward: x (B*S, C) → out (B*S, C)
     void forward(const float* x, float* out, cudaStream_t stream = 0) {
@@ -83,46 +99,31 @@ struct TransformerBlock {
         // ---- Backward through FFN sub-layer ----
         // Residual: gradient passes through directly to d_h, and also
         // flows through the FFN path.
-        Tensor<float> d_h({N, C});
-        cudaMemcpyAsync(d_h.data(), d_out,
+        cudaMemcpyAsync(d_h_buf.data(), d_out,
                         static_cast<size_t>(N) * C * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
 
-        // fc2 backward: d_gelu_out = d_out * W_fc2
-        Tensor<float> d_gelu_out({N, FC});
-        fc2.backward(d_out, d_gelu_out.data(), stream);
+        fc2.backward(d_out, d_gelu_out_buf.data(), stream);
 
-        // GELU backward: d_fc1_out = d_gelu_out * gelu'(fc1_out)
-        Tensor<float> d_fc1_out({N, FC});
-        launch_gelu_backward(d_gelu_out.data(), fc1_out.data(),
-                             d_fc1_out.data(), N * FC, stream);
+        launch_gelu_backward(d_gelu_out_buf.data(), fc1_out.data(),
+                             d_fc1_out_buf.data(), N * FC, stream);
 
-        // fc1 backward: d_ln2_out = d_fc1_out * W_fc1
-        Tensor<float> d_ln2_out({N, C});
-        fc1.backward(d_fc1_out.data(), d_ln2_out.data(), stream);
+        fc1.backward(d_fc1_out_buf.data(), d_ln2_out_buf.data(), stream);
 
-        // ln2 backward: d_h_ffn (contribution to d_h from FFN path)
-        Tensor<float> d_h_ffn({N, C});
-        ln2.backward(d_ln2_out.data(), d_h_ffn.data(), stream);
+        ln2.backward(d_ln2_out_buf.data(), d_h_ffn_buf.data(), stream);
 
-        // Accumulate FFN gradient into d_h
-        launch_add_inplace(d_h.data(), d_h_ffn.data(), N * C, stream);
+        launch_add_inplace(d_h_buf.data(), d_h_ffn_buf.data(), N * C, stream);
 
         // ---- Backward through attention sub-layer ----
         // Residual: d_x gets a copy of d_h
-        cudaMemcpyAsync(d_x, d_h.data(),
+        cudaMemcpyAsync(d_x, d_h_buf.data(),
                         static_cast<size_t>(N) * C * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
 
-        // mha backward: d_ln1_out
-        Tensor<float> d_ln1_out({N, C});
-        mha.backward(d_h.data(), d_ln1_out.data(), stream);
+        mha.backward(d_h_buf.data(), d_ln1_out_buf.data(), stream);
 
-        // ln1 backward: d_x_attn (contribution from attention path)
-        Tensor<float> d_x_attn({N, C});
-        ln1.backward(d_ln1_out.data(), d_x_attn.data(), stream);
+        ln1.backward(d_ln1_out_buf.data(), d_x_attn_buf.data(), stream);
 
-        // Accumulate attention gradient into d_x
-        launch_add_inplace(d_x, d_x_attn.data(), N * C, stream);
+        launch_add_inplace(d_x, d_x_attn_buf.data(), N * C, stream);
     }
 };
