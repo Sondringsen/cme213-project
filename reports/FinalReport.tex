@@ -152,12 +152,12 @@ before bandwidth even becomes relevant.
 We model allreduce latency as $T(n) = \alpha + \beta n$, where $\alpha$ captures
 per-call startup and $\beta = 1/b$ is inverse bandwidth. $\alpha$ and $\beta$ are
 fitted from the \texttt{allreduce\_bench} we made (see Section \ref{sec:bench}).
-For our 20\,MB gradient, the bandwidth term predicts $\approx 7$\,ms per call.
-Because our implementation is not CUDA-aware, each call incurs two PCIe transfers
-of $n$ bytes not included in $T(n)$, so we predict measured latency to exceed
-the model by $\approx 2n/b_\text{PCIe}$.
-The gap between the fitted curve and the ideal network bandwidth is the
-D$\to$H$\to$D PCIe round-trip cost, recoverable only with CUDA-aware MPI.
+For our 20\,MB gradient, the bandwidth term predicts $\approx 7$\,ms per PCIe
+transfer direction. Because our implementation is not CUDA-aware, each call
+incurs a D$\to$H copy and an H$\to$D copy, adding $\approx 2n/b_\text{PCIe}
+\approx 13$\,ms on top of the network cost.
+The gap between the fitted curve and the ideal network bandwidth is therefore
+this D$\to$H$\to$D round-trip cost, recoverable only with CUDA-aware MPI.
 
 
 \paragraph{Amdahl and isoefficiency.}
@@ -209,45 +209,36 @@ message size: latency is flat at small sizes (startup-dominated, $\alpha\approx5
 The 50 calls cumulate to $\approx$18.6\,ms/step.
 
 \textbf{(4) Per-step \texttt{cudaMalloc} in backward.} The Nsight
-Systems timeline (Fig.~\ref{fig:nsys}) shows $\approx$30\,ms of idle GPU
-time per step as \texttt{cudaMalloc} barriers drain the kernel queue.
-\texttt{MultiHeadAttention::backward} and
-\texttt{TransformerBlock::backward} allocated 18 temporary buffers each
-call --- including two $B{\cdot}H{\cdot}S^2$ attention-score matrices
-($\approx$4\,MB each at $B{=}16$). This overhead was invisible to coarse
-step-time measurements.
+Systems timeline (Fig.~\ref{fig:cudamalloc}) shows $\approx$30\,ms of idle GPU
+time per step as \texttt{cudaMalloc} barriers drain the kernel queue. The multi head attention and transformer block allocated 18 temporary buffers in each
+call, including two $B{\cdot}H{\cdot}S^2$ attention-score matrices
+($\approx$4\,MB each at $B{=}16$).
 
 \textbf{(5) Decode has two regimes.} At $B{=}1$ the kernel is
-parallelism-limited: 8 blocks for 72 SMs, giving 5.4\% HBM and 1.6\%
-FP32 utilisation. At $B{=}64$ it saturates bandwidth at 65\% of HBM
-peak (Table~\ref{tab:kernels}), matching the $\approx$0.5\,FLOP/byte
-roofline prediction.
-
-Bottlenecks (1)--(4) together explain the 55\% strong-scaling efficiency
-at $P{=}4$ before optimisation (Table~\ref{tab:scaling}):
-$\approx$30\,ms of cudaMalloc bubbles and $\approx$18.6\,ms of unfused
-allreduce overhead outweigh the compute time that actually scales with
-$P$.
-
+parallelism-limited: 8 blocks (because of the 8 heads) for 72 SMs, giving 5.4\% HBM and 1.6\%
+FP32 utilization. At $B{=}64$ it is bandwidth-bound at 65\% of HBM
+peak (Table~\ref{tab:kernels}), confirming the roofline prediction that
+a kernel at 0.5\,FLOP/byte is bandwidth-limited for large batches.
 \section{Algorithmic Variants}
 
 \paragraph{Variant 1: Register tiling.}
 Extending one-output-per-thread to an $8{\times}8$ register sub-tile
 (64 FP32 accumulators, $BM{=}BN{=}128$, $BK{=}8$, $16{\times}16$ thread
-block) raises arithmetic intensity from 8 to 64\,FLOP/byte, crossing the
-roofline ridge and shifting the bottleneck from shared-memory bandwidth
-to compute. Nsight Compute confirms: throughput rises from 2.20 to
+block) raises arithmetic intensity from 8 to 64\,FLOP/byte, which crosses the
+hardware's ridge point of $\approx$24\,FLOP/byte and shifts the bottleneck from
+shared-memory bandwidth to compute. Nsight Compute confirms that throughput rises from 2.20 to
 9.56\,TFLOPS (13.5\%$\to$58.6\% of FP32 peak, $4.3\times$). cuBLAS
 reaches 70--80\% on Turing without tensor cores; we attain $\sim$75\%
 of that (Fig.~\ref{fig:roofline}, Table~\ref{tab:kernels}).
 
-\paragraph{Variant 2: \texttt{float4} vectorised loads.}
+\paragraph{Variant 2: \texttt{float4} vectorized loads.}
 Scalar 32-bit loads in GELU, Softmax, Cross-Entropy, LayerNorm, and
 \texttt{add\_inplace} are replaced by \texttt{float4}, issuing one
-128-bit transaction per four floats. Nsight Compute confirms the gain:
+128-bit transaction per four floats. Nsight Compute confirms the gain and
 bandwidth rises to 430--471\,GB/s (64--70\% of HBM peak) across all five
-kernels, versus the $\approx$17\% scalar baseline for GELU ---
-a $\approx4\times$ improvement (Table~\ref{tab:kernels}).
+kernels, versus scalar baselines of $\approx$16\% (LayerNorm, $\approx$110\,GB/s)
+and $\approx$17\% (GELU, $\approx$114\,GB/s). This is a $\approx4\times$
+improvement (Table~\ref{tab:kernels}) as expected.
 
 \paragraph{Variant 3: Fused gradient allreduce.}
 50 individual \texttt{MPI\_Allreduce} calls are replaced by one call on
@@ -256,37 +247,37 @@ Fitting $\alpha{+}\beta n$ to the \texttt{allreduce\_bench} data gives
 $\alpha{=}51.2\,\mu$s for $P{=}2$, so eliminating 49 extra call startups
 saves $49{\times}51.2\,\mu\text{s}\approx2.5\,\text{ms}$, consistent
 with the measured $\approx$3\,ms gain. The saving is smaller than
-anticipated because fusion does not reduce the total bytes crossing PCIe:
-the full 20\,MB gradient still traverses D$\to$H$\to$D in both cases.
-At $\approx$3\,GB/s throughput (Fig.~\ref{fig:comm}), that round trip
-costs $\approx$13\,ms regardless of call count, and cannot be recovered
-without CUDA-aware MPI to route gradients directly over NVLink.
+anticipated because fusion does not reduce the total bytes crossing PCIe.
+The full 20\,MB gradient still traverses D$\to$H$\to$D in both cases.
+At $\approx$3\,GB/s effective PCIe staging bandwidth (Fig.~\ref{fig:comm}) that round trip costs $\approx$13\,ms regardless of call
+count and cannot be recovered without CUDA-aware MPI to route gradients directly
+over NVLink.
 
 \paragraph{Variant 4: Pre-allocated backward scratch.}
 Eighteen per-step buffers are moved from backward call sites to the
-constructor, eliminating the cudaMalloc barriers seen in
-Fig.~\ref{fig:nsys}. The ``Before opt.'' baseline in
-Table~\ref{tab:scaling} has none of Variants 1--4 applied. At $P{=}1$
-there is no allreduce, so Variant~3 contributes zero; the 14\,ms
-reduction from 162.7 to 148.8\,ms reflects Variants 1, 2, and 4 combined
---- we cannot isolate Variant~4 further without intermediate measurements.
-At $P{=}4$, all four variants together drop step time from 74.5 to
-59.8\,ms: communication falls 18.6$\to$15.6\,ms from fusing (V3) and
-compute falls 55.9$\to$44.2\,ms from kernel and allocation optimisations
-(V1+V2+V4), raising strong-scaling efficiency from 55\% to 62\%
-(Table~\ref{tab:scaling}).
+constructor, eliminating the $\approx$30\,ms of per-step cudaMalloc barriers
+identified in Section~\ref{sec:bottleneck}. Figs.~\ref{fig:cudamalloc}
+and~\ref{fig:cudamalloc_after} show the Nsight Systems timeline before and after.
+The allocations and the resulting idle GPU time are absent in the optimized
+profile.
 
 \paragraph{Variant 5: PagedAttention for inference.}
-Block-table indirection raises KV-cache utilisation from 39.4\% to 88.0\%
+Block-table indirection raises KV-cache utilization from 39.4\% to 88.0\%
 at $B{=}64$ ($2.2\times$) with only 1.3\% latency overhead, allowing the
 same memory budget to serve $2.2\times$ more concurrent requests
-(Table~\ref{tab:paged}, Appendix~\ref{app:paged}).
+(Table~\ref{tab:paged}).
 
 \section{Scalability Analysis}
 
-Table~\ref{tab:scaling} reports strong and weak scaling. ``Before opt.''
-is the unoptimised implementation with none of Variants 1--4 applied;
-``After opt.'' applies all four..
+Table~\ref{tab:scaling} reports strong and weak scaling before and after
+applying all four variants. At $P{=}1$ there is no allreduce, so Variant~3
+contributes zero; the 14\,ms reduction from 162.7 to 148.8\,ms reflects
+Variants 1, 2, and 4 combined (no intermediate measurements were taken to
+isolate Variant~4). At $P{=}4$, all four variants together drop step time
+from 74.5 to 59.8\,ms: communication falls 18.6$\to$15.6\,ms from fusing
+(V3) and compute falls 55.9$\to$44.2\,ms from kernel and allocation
+optimizations (V1+V2+V4), raising strong-scaling efficiency from 55\% to
+62\%.
 
 \begin{table}[h]
   \centering\small\setlength{\tabcolsep}{5pt}
@@ -325,65 +316,70 @@ is the unoptimised implementation with none of Variants 1--4 applied;
 \end{figure}
 
 \paragraph{Amdahl and isoefficiency.}
-At $P{=}4$ after optimization, $E_4{=}62\%$, so the serial fraction is
-$f \approx 0.25$, almost entirely communication (comm fraction 26.1\%).
-Since $E(P) = T_\text{compute}/(T_\text{compute} + T_\text{comm})$ per rank,
-our ratio $T_\text{compute}/T_\text{comm} = 44/15.6 \approx 2.8$ directly
-explains the 62\% efficiency. Two paths raise this ratio: increase local
-compute $\approx 3.2\times$ (local $B$ from 4 to $\approx 13$), or adopt
-CUDA-aware MPI to cut comm to $\sim$7\,ms (removing PCIe staging),
-giving ratio $\approx 6.3$.
+At $P{=}4$ after optimization, 44.2\,ms is compute and 15.6\,ms is allreduce
+(26\% of step time), giving $E_4 = T_1/(4T_4) = 148.8/(4\times59.8) \approx 62\%$.
+The compute/comm ratio is $T_\text{compute}/T_\text{comm} = 44/15.6 \approx 2.8$.
+We can increase this ratio in two ways. First, we can increase the local batch (more compute per
+allreduce call), or second, we can adopt CUDA-aware MPI to cut comm to $\sim$7\,ms
+(removing PCIe staging), giving ratio $44/7 \approx 6.3$.
 
 \paragraph{Weak scaling.}
-Efficiency drops from 100\% to 75\% ($P{=}2$) and 73\% ($P{=}4$): comm
-cost is fixed by gradient size, not local batch. At $P{=}4$ the comm
-fraction matches strong scaling exactly (26\%). Appendix~\ref{app:weak}.
+Efficiency at fixed $B_\text{local}{=}4$ is 75\% ($P{=}2$) and 73\% ($P{=}4$),
+shown after-opt only in Fig.~\ref{fig:weak}.
+Efficiency is below 100\% because at $P{=}1$ there is no allreduce, whereas
+for $P{>}1$ every rank pays a fixed $\approx$15.6\,ms allreduce overhead that
+does not shrink with local batch size, it is determined by the size of the gradient.
+At $P{=}2$, weak efficiency (75\%) is lower than strong (80\%) because strong
+scaling at $P{=}2$ gives each rank $B_\text{local}{=}8$, doubling the compute
+per allreduce call. At $P{=}4$ both regimes coincide at $B_\text{local}{=}4$.
 
 \section{Correctness and Verification}
 
 \paragraph{Per-kernel.}
-Every CUDA kernel is validated against a plain C++ CPU implementation:
-$\text{rel}\leq 10^{-3}$ or $\text{abs}\leq 10^{-5}$ (the absolute guard
-prevents near-zero values from spuriously failing). Forward kernels are
-also compared to PyTorch references. All forward and backward tests pass.
-
-\paragraph{Distributed and PagedAttention.}
-Three multi-rank checks. Step-1 loss is bit-identical across
-$P\in\{1,2,4\}$ (6.5336) --- \texttt{MPI\_Bcast} and the deterministic
-forward are correct. All configurations drive loss toward the
-random-token entropy floor; Wikitext-2 trains correctly ($9.27\to <6.0$
-over 300 steps at $P{=}4$). At ranks=4 and local\_B=4, strong and weak
-step times agree within 0.02\,ms. For PagedAttention,
-\texttt{launch\_paged\_attention\_decode} matches the contiguous
-reference \texttt{launch\_dense\_attention\_decode} \textbf{bit-identically}
+Every CUDA kernel is validated against a plain C++ CPU implementation
+with tolerances $\text{rel}\leq 10^{-3}$ or $\text{abs}\leq 10^{-5}$.
+The absolute guard prevents near-zero values from spuriously failing.
+Forward kernels are additionally compared to PyTorch references.
+All forward and backward tests pass. Table~\ref{tab:errors} reports the
+achieved errors for each kernel. The PagedAttention decode kernel is
+verified against the contiguous reference bit-identically
 (abs $=$ 0, rel $=$ 0) across all seven test configurations, including
-scrambled block-table mappings (which would fail if the indirection were
-ignored). Both also match a CPU oracle within FP32 \texttt{expf}
-tolerance.
+scrambled block-table orderings that would fail silently if the
+indirection were ignored. Both also match a CPU oracle within FP32
+\texttt{expf} tolerance.
+
+\paragraph{Distributed training.}
+We perform two multi-rank consistency checks. The step-1 loss is
+bit-identical across $P\in\{1,2,4\}$ (6.5336), confirming that
+\texttt{MPI\_Bcast} and the deterministic forward pass are correct. All
+configurations drive loss toward the random-token entropy floor.
+On Wikitext-2, the model trains correctly, falling from 9.27 to below
+6.0 cross-entropy over 300 steps at $P{=}4$.
 
 \section{Discussion}
 
 \paragraph{Biggest payoffs.}
-All four optimisations together cut 4-GPU step time by $\approx$15\,ms
+All four optimizations together cut 4-GPU step time by $\approx$15\,ms
 (74.5$\to$59.8\,ms, $\approx$20\%). Register tiling ($4.3\times$ on
 GEMM throughput) and \texttt{float4} (64--70\% of HBM peak) were
-identified by Nsight Compute. The allreduce fusion and scratch
-pre-allocation were invisible to coarse \texttt{chrono} timing and
-required Nsight Systems to surface --- the former bounded by PCIe staging,
-the latter by cudaMalloc barriers in the backward timeline.
+identified and quantified by Nsight Compute. The allreduce fusion and
+scratch pre-allocation were only visible through Nsight Systems timeline
+profiling. The former as PCIe staging between the GPU and host, the
+latter as cudaMalloc barriers stalling the backward timeline.
 
 \paragraph{Limitations and future work.}
-The largest remaining lever is CUDA-aware MPI: the $\approx$8\,ms of
-D$\to$H/H$\to$D PCIe staging per step would disappear over NVLink. Flash
-Attention backward is $O(S^2)$; FA2's recomputation backward~\cite{dao2023}
-is needed for longer sequences. BF16~\cite{micikevicius2018} is not
-implemented because Turing has no BF16 tensor cores --- they run on
-regular CUDA cores at FP32 throughput. On Ampere/Hopper, native BF16
-tensor cores would give $4\times$ compute and $2\times$ memory savings.
-For inference, the natural PagedAttention extensions are prefix caching
-(block sharing for common prompts), copy-on-write beam search, and chunked
-prefill. Starting with a bucketed allreduce and pre-allocated scratch from
-day one would have saved hours of debugging.
+The largest remaining lever is CUDA-aware MPI. The $\approx$8\,ms of
+D$\to$H$\to$D PCIe staging per step would disappear over NVLink. Flash
+Attention backward is $O(S^2)$ and FA2's recomputation
+backward~\cite{dao2023} would be needed for longer sequences.
+BF16~\cite{micikevicius2018} is not implemented because Turing has no
+BF16 tensor cores, so BF16 arithmetic runs on regular CUDA cores at FP32
+throughput. On Ampere/Hopper, native BF16 tensor cores would roughly
+halve memory footprint and double matrix-multiply throughput relative to
+FP32. Finally, our 5\,M-parameter model on Wikitext-2 reaches a
+perplexity floor that is too high for coherent text generation. Scaling
+to a full GPT-2 configuration (124\,M parameters) on a larger corpus
+may give meaningful inference.
 
 \begin{thebibliography}{9}
 
@@ -536,6 +532,24 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
   \label{fig:roofline}
 \end{figure}
 
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/cudamalloc.png}
+    \caption{Nsight Systems timeline \textbf{before} pre-allocation: repeated
+      \texttt{cudaMalloc} calls stall the kernel queue, producing $\approx$30\,ms
+      of idle GPU time per step.}
+    \label{fig:cudamalloc}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/cudamalloc_after.png}
+    \caption{Nsight Systems timeline \textbf{after} pre-allocation: the
+      \texttt{cudaMalloc} stalls are absent and the kernel queue runs
+      without interruption.}
+    \label{fig:cudamalloc_after}
+\end{figure}
+
 \newpage
 \section{Communication Benchmark}\label{app:comm}
 
@@ -546,7 +560,7 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
     $P{=}2$, and $P{=}4$, 100-trial averages. At small sizes latency is
     flat ($\alpha$-dominated, startup cost per call); at large sizes it
     grows with slope~1 ($\beta n$-dominated), implying an effective
-    bandwidth of $\approx$3\,GB/s --- set by the PCIe D$\to$H$\to$D
+    bandwidth of $\approx$3\,GB/s, constrained by the PCIe D$\to$H$\to$D
     round trip rather than the network. CUDA-aware MPI would bypass these
     copies.}
   \label{fig:comm}
