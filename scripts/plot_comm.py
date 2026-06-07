@@ -60,11 +60,6 @@ def main():
             pred_us = alpha_beta(GRADIENT_BYTES, alpha_us, beta_us_per_byte)
             print(f"  Predicted allreduce at {GRADIENT_BYTES/1e6:.1f} MB: {pred_us/1e3:.2f} ms")
 
-            # Ring All-Reduce theoretical lower bound (point-to-point params)
-            t_ring = 2 * (ranks - 1) / ranks * alpha_beta(n_bytes, alpha_us, beta_us_per_byte)
-            ax.loglog(n_bytes, t_ring, "--", color=colors[ranks], alpha=0.5,
-                      label=f"Ring bound P={ranks}")
-
         ax.loglog(n_bytes, t_us, "o-", color=colors[ranks],
                   label=f"Measured P={ranks}")
 
