@@ -119,6 +119,24 @@ Key outputs:
 - `src/data/data_loader.hpp`
 - `plots/loss_curve.png`
 
+### Step 7b — PagedAttention Decode Kernel (code + analysis, ~7–8 hours)
+**File:** `plan/step8_paged_attention.md`
+
+A fifth algorithmic variant focused on *inference*, distinct from the four training-time optimizations above. Implements the PagedAttention decode kernel from Kwon et al. (vLLM, SOSP 2023): the KV cache is split into fixed-size 16-token blocks managed from a global pool, and each sequence holds a block table mapping logical positions to physical blocks. The kernel mirrors the Flash Attention online-softmax recurrence but reads K and V through the block-table indirection.
+
+Scope is deliberately tight: standalone kernel + simple block manager + standalone benchmark (paged vs naive padded layouts) — *not* a full rewrite of `main_inference.cu`. Generates the report numbers without the integration risk.
+
+Key outputs:
+- `src/kernels/paged_attention.{cuh,cu}`
+- `src/inference/paged_kv_cache.hpp`
+- `tests/test_paged_attention.cu` (correctness vs Flash Attention reference)
+- `benchmarks/paged_attention_bench.cu`
+- `plots/paged_attention.png` (memory utilization + throughput vs naive)
+- New §7 paragraph + Appendix D + abstract sentence in `FinalReport.tex`
+- New bibliography entry (Kwon et al. 2023)
+
+Roofline story: this kernel sits in a *different* regime than training GEMM — decode arithmetic intensity is ~1 FLOP/byte (memory-bound, gather-dominated). Gives the report a second roofline conclusion qualitatively distinct from the training analysis.
+
 ### Step 7 — BF16 Analysis (report-only, ~30 min)
 No code needed. In the report, explain:
 - **Why BF16 was not implemented on Turing (sm_75)**: Turing has FP16 tensor cores but no native BF16 tensor cores. BF16 on Turing executes on regular CUDA cores at the same throughput as FP32 — so BF16 gives 2× memory reduction but zero compute speedup on our hardware.
@@ -160,6 +178,7 @@ Appendix C: Full kernel performance table + roofline + α+βn plot
 | Jun 4 | Step 4: communication analysis benchmark |
 | Jun 4-5 | Step 5: extended scaling experiments |
 | Jun 5 (optional) | Step 6: WikiText-2 data pipeline |
+| Jun 6-7 | Step 7b: PagedAttention decode kernel + benchmark |
 | Jun 5-7 | Step 8: write report |
 | Jun 8 | Final review + submit |
 
@@ -191,6 +210,7 @@ Appendix C: Full kernel performance table + roofline + α+βn plot
 | Nsight Compute screenshot (GEMM before) | ncu GUI | Appendix A |
 | Nsight Compute screenshot (GEMM after) | ncu GUI | Appendix A |
 | Nsight Systems timeline | nsys GUI | Appendix B |
+| PagedAttention mem utilization + throughput | `paged_attention_bench` output | §7 + Appendix D |
 
 ---
 

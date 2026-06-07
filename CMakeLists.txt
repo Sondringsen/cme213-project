@@ -54,6 +54,8 @@ add_library(llm STATIC
     # Flash Attention (forward + naive backward)
     src/kernels/attention.cu
     src/kernels/attention_cpu.cpp
+    # PagedAttention decode (inference)
+    src/kernels/paged_attention.cu
     # Embedding (forward + backward)
     src/kernels/embedding.cu
     # Adam optimizer
@@ -97,6 +99,7 @@ add_kernel_test(test_backward_layernorm)
 add_kernel_test(test_backward_gelu)
 add_kernel_test(test_backward_cross_entropy)
 add_kernel_test(test_backward_attention)
+add_kernel_test(test_paged_attention)
 
 # PyTorch comparison test
 add_executable(test_vs_pytorch tests/test_vs_pytorch.cu)
@@ -135,3 +138,10 @@ endif()
 add_executable(run_inference src/main_inference.cu)
 target_link_libraries(run_inference PRIVATE llm)
 target_include_directories(run_inference PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# ---------------------------------------------------------------------------
+# PagedAttention benchmark (single GPU, no MPI)
+# ---------------------------------------------------------------------------
+add_executable(paged_attention_bench benchmarks/paged_attention_bench.cu)
+target_link_libraries(paged_attention_bench PRIVATE llm)
+target_include_directories(paged_attention_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
