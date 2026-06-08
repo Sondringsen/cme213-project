@@ -36,23 +36,24 @@ utilization at large batch sizes with negligible latency overhead.
 \section{Project Description}
 
 We train a decoder-only GPT-2-style transformer~\cite{radford2019} on
-sequences of token IDs. Inputs: a batch of $B$ integer sequences of length
+sequences of token IDs. We focus on the fundamental kernels in the transformer architecture and how we can optimize these. We use
+synthetic random tokens for scaling and profiling experiments and Wikitext-2 for realistic training dynamics. However, the main focus for the project is profiling and optimization analysis, not a competitive LLM. A single forward
+step has 36+ GEMMs and $O(S^2)$ attention in naive form. Realistic batch
+sizes easily outgrow single-GPU memory and per-step latency multiplies into hours
+at full scale. This motivates both multi-GPU training and KV-cache
+management for inference.
+
+\paragraph{Setup.}
+Inputs: a batch of $B$ integer sequences of length
 $S$. Outputs: per-position vocabulary logits, reduced to a scalar
 cross-entropy loss and backpropagated through every parameter with
 Adam~\cite{kingma2015}. Each Pre-LayerNorm block applies multi-head causal
 self-attention then a two-layer GELU FFN, both with residuals. Notation:
 $B$ batch, $S$ sequence, $C$ model dim, $H$ heads, $D{=}C/H$, $V$ vocab.
-All tensors FP32 row-major.
-
-\paragraph{Setup.}
+All tensors FP32 row-major. We use the class compute cluster which has peak FP32 16.31\,TFLOPS; peak HBM 672\,GB/s; ridge
+$\approx$24\,FLOP/byte. 
 Default config: $n_\text{layers}{=}6$, $C{=}256$, $H{=}8$ ($D{=}32$),
-$S{=}128$, $V{=}512$, which gives about 5\,M parameters, 20\,MB of gradient. We use
-synthetic random tokens for scaling and profiling experiments and Wikitext-2 for realistic training dynamics. However, the main focus for the project is profiling and optimization analysis, not a competitive LLM. We use the class compute cluster which has peak FP32 16.31\,TFLOPS; peak HBM 672\,GB/s; ridge
-$\approx$24\,FLOP/byte. A single forward
-step has 36+ GEMMs and $O(S^2)$ attention in naive form. Using realistic batch
-sizes easily outgrow single-GPU memory and per-step latency multiplies into hours
-at full scale. This motivates both multi-GPU training and KV-cache
-management for inference.
+$S{=}128$, $V{=}512$, which gives about 5\,M parameters, 20\,MB of gradient. 
 
 \section{Algorithms and State of the Art}
 The below paragraphs discuss some of the algorithms and kernels we implemented. An overview of all implemented kernels can be found in the Appendix in Table \ref{tab:all_kernels}.
@@ -67,7 +68,7 @@ FP16/INT8~\cite{micikevicius2018}, so we keep everything as FP32.
 \paragraph{Attention.}
 Flash Attention~\cite{dao2022} tiles $Q, K, V$ in SRAM with an online
 softmax, reducing memory from $O(S^2)$ to $O(S{\cdot}D)$ at the same output.
-We implement FA1 forward; the backward uses the naive $O(S^2)$
+We implement FA1 forward, the backward uses the naive $O(S^2)$
 materialization. FA2's recomputation backward~\cite{dao2023} would be
 needed for longer sequences.
 
@@ -87,7 +88,7 @@ PagedAttention~\cite{kwon2023} manages variable-length KV caches via
 virtual-memory-style block tables. We implement this for the decode step as discussed in the last guest lecture.
 
 \section{Parallelization Strategy}
-This section presents the final optimized design. The bottlenecks that motivated each decision and the variants explored to reach it are covered in Sections~\ref{sec:bottleneck} and~\ref{sec:variants}.
+This section presents the final optimized design. The bottlenecks that motivated each decision and the variants explored to reach it are covered in Section~\ref{sec:bottleneck}.
 
 \paragraph{System overview.} We organize our system in five layers. CUDA kernels, stateful modules (Linear, LayerNormLayer,
 EmbeddingLayer, MultiHeadAttention, TransformerBlock), \texttt{GPT2} model,
@@ -108,7 +109,7 @@ bank conflicts.
 \paragraph{Flash Attention and bandwidth-bound kernels.}
 Flash Attention tiles $Q, K, V$ into SRAM, maintaining a running max
 $m^{(j)}$ and normalizer $\ell^{(j)}$ with online correction
-$e^{m^{(j-1)}-m^{(j)}}$ (similar to what we did in the homework). Causal masking is per-tile; one block per
+$e^{m^{(j-1)}-m^{(j)}}$ (similar to what we did in the homework). Causal masking is per-tile, one block per
 (batch, head, query-tile). LayerNorm uses a two-pass block reduction. The two passes were necessary to avoid catastrophic cancellation when computing the variance. GELU, Softmax, Cross-Entropy, the LayerNorm output
 pass, and the residual \texttt{add\_inplace} use \texttt{float4} 128-bit
 loads, which gives 4 floats per memory instruction, using the full 128-bit memory
@@ -134,7 +135,7 @@ sitting below the ridge and shared-memory-bandwidth-bound.
 With $8{\times}8$ register tiling, intensity rises to 64\,FLOP/byte, above the ridge.
 \emph{Prediction:} register tiling moves GEMM from memory- to compute-bound.
 LayerNorm, GELU, Softmax, and Cross-Entropy have $O(1)$ intensity and stay
-memory-bound. These kernels therefore benefit from more efficient memory management.
+memory-bound. These kernels therefore benefit from more efficient memory management. So with vectorized loads using \texttt{float4} we should get roughly a 4$\times$ better HBM utilization.
 The decode kernel sits at $\approx 0.5$\,FLOP/byte, far below the ridge.
 With one block per (request, head), the grid has $H{\cdot}B$ blocks. For $H{=}8$
 the grid fills 72 SMs only at $B \geq 9$, so small batches are SM-count-limited
@@ -174,88 +175,98 @@ over 20 training steps. This allows us to compare measurements with our performa
 
 We defer the results and comparison to the performance model to Sections \ref{sec:bottleneck}–\ref{sec:scalability}.
 
-\section{Bottleneck Analysis}\label{sec:bottleneck}
+\section{Bottleneck Analysis and Algorithmic Variants}\label{sec:bottleneck}
 
-Nsight Compute and Nsight Systems identify
-four training bottlenecks and a fifth inference regime.
+We consider the implementation that led to the parallelization strategy explained above. First we identify
+four training bottlenecks and a fifth inference regime using Nsight Compute and Nsight Systems. We then use these empirical observations to optimize the implementation. We consider 5 different algorithmic variants. Figure \ref{fig:roofline} shows the kernels before and after our optimizations.
 
-\textbf{(1) GEMM below the roofline ridge.} Without register tiling,
+\paragraph{Register tiling.}
+
+As predicted GEMM is initially  below the roofline ridge. Without register tiling,
 Nsight Compute places GEMM at 2.20\,TFLOPS = 13.5\% of FP32 peak and
 8\,FLOP/byte, left of the $\approx$24\,FLOP/byte ridge
 (Fig.~\ref{fig:roofline}). The kernel is memory-bound in shared memory, not global memory.
 Each thread reads shared-memory tiles without accumulating enough FMAs per read to saturate the FP32 units.
 
-\textbf{(2) Scalar loads on memory-bound kernels.} GELU, Softmax,
-Cross-Entropy, and LayerNorm have $O(1)$ arithmetic intensity, so their
-ceiling is HBM bandwidth. Nsight Compute reports GELU at
-$\approx$114\,GB/s = 17\% of HBM peak before optimization
-(Table~\ref{tab:kernels}).
-
-\textbf{(3) Per-tensor allreduce.} 50 separate \texttt{MPI\_Allreduce}
-calls per step each trigger a D$\to$H cudaMemcpy, a collective, and an
-H$\to$D cudaMemcpy. Fig.~\ref{fig:comm} shows the measured latency vs.\
-message size. Latency is flat at small sizes (startup-dominated, $\alpha\approx51\,\mu$s per call for $P{=}2$) then grows with slope 1 on the log--log plot at large sizes ($\beta n$-dominated), implying an effective bandwidth of $\approx$3\,GB/s, constrained by the PCIe D$\to$H$\to$D round trip rather than the network.
-The 50 calls cumulate to $\approx$18.6\,ms/step which we want to reduce.
-
-\textbf{(4) Per-step \texttt{cudaMalloc} in backward.} The Nsight
-Systems timeline (Fig.~\ref{fig:cudamalloc}) shows $\approx$30\,ms of idle GPU
-time per step as \texttt{cudaMalloc} barriers drain the kernel queue. The multi head attention and transformer block allocated 18 temporary buffers in each
-call, including two $B{\cdot}H{\cdot}S^2$ attention-score matrices
-($\approx$4\,MB each at $B{=}16$).
-
-\textbf{(5) Decode is parallelism-limited at small batch sizes.} With one block per (request, head), the grid has only $H{\cdot}B$ blocks. At $B{=}1$ this gives 8 blocks for 72 SMs, leaving most of the device idle. At larger $B$ the grid fills the device and the kernel transitions to being bandwidth-limited, consistent with its $\approx$0.5\,FLOP/byte arithmetic intensity.
-\section{Algorithmic Variants}\label{sec:variants}
-
-\paragraph{Variant 1: Register tiling.}
-Extending one-output-per-thread to an $8{\times}8$ register sub-tile raises arithmetic intensity from 8 to 64\,FLOP/byte, which crosses the
+We remedy this by adding register tiling. We extend one-output-per-thread to an $8{\times}8$ register sub-tile. This raises arithmetic intensity from 8 to 64\,FLOP/byte, which crosses the
 hardware's ridge point of $\approx$24\,FLOP/byte and shifts the bottleneck from
 shared-memory bandwidth to compute. Nsight Compute confirms that throughput rises from 2.20 to
 9.56\,TFLOPS (13.5\%$\to$58.6\% of FP32 peak, $4.3\times$). We benchmark against cuBLAS which
 reaches 70--80\%. We attain $\sim$75\%
 of that (Fig.~\ref{fig:roofline}, Table~\ref{tab:kernels}).
 
-\paragraph{Variant 2: \texttt{float4} vectorized loads.}
-Scalar 32-bit loads in GELU, Softmax, Cross-Entropy, LayerNorm, and
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.45\linewidth]{plots/roofline_before}%
+  \hfill
+  \includegraphics[width=0.45\linewidth]{plots/roofline_after}
+  \caption{Roofline analysis.
+    \textbf{Left:} before optimization,
+    \textbf{Right:} after optimization.}
+  \label{fig:roofline}
+\end{figure}
+
+\paragraph{Scalar loads to vectorized \texttt{float4} loads.}
+
+We improve the memory-management of the O(1) kernels. Scalar 32-bit loads in GELU, Softmax, Cross-Entropy, LayerNorm, and
 \texttt{add\_inplace} are replaced by \texttt{float4}, issuing one
 128-bit transaction per four floats. Nsight Compute confirms the gain and
 bandwidth rises to 430--471\,GB/s (64--70\% of HBM peak) across all five
-kernels, versus scalar baselines of $\approx$16--17\%.
+kernels, versus scalar baselines of $\approx$16--18\%.
 This is a $\approx4\times$ improvement (Table~\ref{tab:kernels}) as expected.
 
-\paragraph{Variant 3: Fused gradient allreduce.}
-50 individual \texttt{MPI\_Allreduce} calls are replaced by one call on
-a contiguous 20\,MB pinned buffer to eliminate redundant startup overhead.
+\paragraph{Per-tensor allreduce to fused gradient allreduce.} Our first implementation had 50 separate \texttt{MPI\_Allreduce}
+calls per step each triggering a D$\to$H cudaMemcpy, a collective, and an
+H$\to$D cudaMemcpy. The 50 calls cumulate to $\approx$18.6\,ms/step which we want to reduce.
+
+
+
+We therefore replace the 50 individual \texttt{MPI\_Allreduce} calls with one contiguous 20\,MB pinned buffer to eliminate redundant startup overhead.
 Fitting $\alpha{+}\beta n$ to the \texttt{allreduce\_bench} data gives
 $\alpha{=}51.2\,\mu$s for $P{=}2$, so eliminating 49 extra call startups
 saves $49{\times}51.2\,\mu\text{s}\approx2.5\,\text{ms}$, consistent
 with the measured $\approx$3\,ms gain. The saving is smaller than
-anticipated because fusion does not reduce the total bytes crossing PCIe.
+what we predicted because fusion does not reduce the total bytes crossing PCIe.
 The full 20\,MB gradient still traverses D$\to$H$\to$D in both cases.
 At $\approx$3\,GB/s effective PCIe staging bandwidth (Fig.~\ref{fig:comm}) that round trip costs $\approx$13\,ms regardless of call
 count and cannot be recovered without CUDA-aware MPI to route gradients directly
 over NVLink.
 
-\paragraph{Variant 4: Pre-allocated backward scratch.}
-Eighteen per-step buffers are moved from the backward call to the
+\paragraph{From per-step \texttt{cudaMalloc} in backward to pre-allocated backward scratch.}
+ The Nsight
+Systems timeline (Fig.~\ref{fig:cudamalloc}) shows $\approx$30\,ms of idle GPU
+time per step as \texttt{cudaMalloc} barriers drain the kernel queue. The multi head attention and transformer block allocated 18 temporary buffers in each
+call, including two $B{\cdot}H{\cdot}S^2$ attention-score matrices
+($\approx$4\,MB each at $B{=}16$).
+
+The eighteen per-step buffers are moved from the backward call to the
 constructor, eliminating the $\approx$30\,ms of per-step cudaMalloc barriers. Figs.~\ref{fig:cudamalloc}
 and~\ref{fig:cudamalloc_after} show the Nsight Systems timeline before and after.
 The allocations and the resulting idle GPU time are absent in the optimized
 profile.
 
-\paragraph{Variant 5: PagedAttention for inference.}
-Block-table indirection raises KV-cache utilization from 39.4\% to 88.0\%
+\paragraph{PagedAttention for inference.}
+ With one block per (request, head), the grid has only $H{\cdot}B$ blocks. At $B{=}1$ this gives 8 blocks for 72 SMs, leaving most of the device idle. At larger $B$ the grid fills the device and the kernel transitions to being bandwidth-limited, consistent with its $\approx$0.5\,FLOP/byte arithmetic intensity.
+
+We improve the memory-management in inference with PagedAttention. Block-table indirection raises KV-cache utilization from 39.4\% to 88.0\%
 at $B{=}64$ ($2.2\times$) with only 1.3\% latency overhead, allowing the
 same memory budget to serve $2.2\times$ more concurrent requests
 (Table~\ref{tab:paged}).
 
+
+
+
+
+
+
+
 \section{Scalability Analysis}\label{sec:scalability}
 
 
-Table~\ref{tab:scaling} reports strong and weak scaling before and after
-applying all four variants. At $P{=}1$ there is no allreduce, so Variant~3
+Now we consider the third regime for modeling performance by looking at strong and weak scaling. Table~\ref{tab:scaling} (Figs also included in Appendix \ref{app:scaling}) reports strong and weak scaling before and after
+applying the four variants involved in training, as described above. At $P{=}1$ there is no allreduce, so Variant~3
 contributes zero. The 14\,ms reduction from 162.7 to 148.8\,ms reflects
-Variants 1, 2, and 4 combined (no intermediate measurements were taken to
-isolate Variant~4). At $P{=}4$, all four variants together drop step time
+Variants 1, 2, and 4 combined. At $P{=}4$, all four variants together drop step time
 from 74.5 to 59.8\,ms. Communication falls 18.6$\to$15.6\,ms from fusing
 (V3) and compute falls 55.9$\to$44.2\,ms from kernel and allocation
 optimizations (V1+V2+V4), raising strong-scaling efficiency from 55\% to
@@ -288,20 +299,13 @@ optimizations (V1+V2+V4), raising strong-scaling efficiency from 55\% to
   \label{tab:scaling}
 \end{table}
 
-\begin{figure}[h]
-  \centering
-  \includegraphics[width=0.95\linewidth]{strong_scaling}
-  \caption{Strong scaling: step-time breakdown into compute
-    (forward + backward + Adam) and communication
-    (\texttt{allreduce\_gradients}). Total $B{=}16$, 20-step averages.}
-  \label{fig:scaling}
-\end{figure}
+
 
 \paragraph{Amdahl and isoefficiency.}
 At $P{=}4$ after optimization, 44.2\,ms is compute and 15.6\,ms is allreduce
 (26\% of step time), giving $E_4 = T_1/(4T_4) = 148.8/(4\times59.8) \approx 62\%$.
-The compute/comm ratio is $T_\text{compute}/T_\text{comm} = 44/15.6 \approx 2.8$.
-We can increase this ratio in two ways. First, we can increase the local batch (more compute per
+We get $T_\text{compute}/T_\text{comm} = 44/15.6 \approx 2.8$.
+We can increase this ratio in two ways. First, we may increase the local batch (more compute per
 allreduce call), or second, we can adopt CUDA-aware MPI to cut comm to $\sim$7\,ms
 (removing PCIe staging), giving ratio $44/7 \approx 6.3$.
 
@@ -362,6 +366,8 @@ FP32. Finally, our 5\,M-parameter model on Wikitext-2 reaches a
 perplexity floor that is too high for coherent text generation. Scaling
 to a full GPT-2 configuration (124\,M parameters) on a larger corpus
 may give meaningful inference.
+
+
 
 \begin{thebibliography}{9}
 
@@ -493,7 +499,7 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
     Paged Decode  & BW      & ---                  & ---    & 435\,GB/s    & 65\%   \\
     \bottomrule
   \end{tabular}
-  \caption{Per-kernel performance: baseline vs.\ optimised on RTX\,6000
+  \caption{Per-kernel performance: baseline vs.\ optimized on RTX\,6000
     (sm\_75). Peak: 16.31\,TFLOPS FP32, 672\,GB/s HBM. All numbers from
     Nsight Compute training-run profiles (1 step, 4-layer, $C{=}256$,
     $S{=}128$). Flash Attention at 10\% of FP32 peak in both
@@ -507,22 +513,7 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
   \label{tab:kernels}
 \end{table}
 
-\begin{figure}[h]
-  \centering
-  \includegraphics[width=0.49\linewidth]{plots/roofline_before}%
-  \hfill
-  \includegraphics[width=0.49\linewidth]{plots/roofline_after}
-  \caption{Roofline for RTX\,6000 (sm\_75). FP32 ceiling 16.31\,TFLOPS;
-    HBM ceiling 672\,GB/s; ridge $\approx$24\,FLOP/byte. \textbf{Left:} before
-    optimisation -- GEMM sits at $I{=}8$\,FLOP/byte (shared-memory tiling),
-    bandwidth-bound kernels reach only $\approx$16--17\% of HBM peak.
-    \textbf{Right:} after optimisation -- register tiling moves GEMM to
-    $I{=}64$\,FLOP/byte and 58.6\% of FP32 peak; \texttt{float4} loads
-    push all bandwidth-bound kernels to 64--70\% of HBM peak.
-    Flash Attention ($B{=}1$, $S{=}2048$) is parallelism-limited at this
-    batch size (8 blocks / 72 SMs) and sits below the roofline ceiling.}
-  \label{fig:roofline}
-\end{figure}
+
 
 \begin{figure}[h]
     \centering
@@ -588,7 +579,7 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
 \end{table}
 
 \newpage
-\section{Weak Scaling}\label{app:weak}
+\section{Scaling}\label{app:scaling}
 
 \begin{figure}[h]
   \centering
@@ -598,6 +589,15 @@ Table \ref{tab:all_kernels} shows an overview of every kernel we implemented.
     regardless of batch size --- confirming that comm cost is dominated by
     gradient size, not compute volume.}
   \label{fig:weak}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.95\linewidth]{strong_scaling}
+  \caption{Strong scaling: step-time breakdown into compute
+    (forward + backward + Adam) and communication
+    (\texttt{allreduce\_gradients}). Total $B{=}16$, 20-step averages.}
+  \label{fig:scaling}
 \end{figure}
 
 \newpage
